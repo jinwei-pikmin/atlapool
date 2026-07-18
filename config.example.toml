@@ -1,0 +1,25 @@
+port = 8080
+
+# Secret reference formats:
+#   "env:VAR_NAME"                                  — from environment variable
+#   "aws:secretsmanager:secret-name:json-key"       — from AWS Secrets Manager (JSON key)
+#   "gcp:secretmanager:projects/<project>/secrets/<secret>/versions/latest" — from GCP Secret Manager
+
+[atlassian]
+# base_url = "https://your-domain.atlassian.net"
+# token = "env:ATLASSIAN_TOKEN"
+
+[mcp]
+enabled = false
+# enable_writes = false
+# session_ttl_secs = 3600
+
+[audit]
+# path = "/var/lib/atlapool/audit.jsonl"
+
+# [[agents]]
+# id = "demo-agent"
+# key = "env:ATLAPOOL_KEY_DEMO"
+# projects = ["PROJ-X"]
+# spaces = ["SPACE-Y"]
+# tools = ["jira_search_issues", "confluence_read_page"]

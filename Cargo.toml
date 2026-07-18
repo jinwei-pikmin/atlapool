@@ -1,0 +1,19 @@
+[package]
+name = "atlapool"
+version = "0.1.0"
+edition = "2021"
+description = "Atlassian credential proxy (Jira + Confluence) with per-agent allowlists"
+license = "MIT"
+
+[dependencies]
+axum = "0.8.1"
+tokio = { version = "1.43", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["trace"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
