@@ -9,6 +9,7 @@ use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::upstream::UpstreamClient;
 use crate::{agents, AppState};
 
 const MCP_KEY_HEADER: &str = "x-atlapool-key";
@@ -184,56 +185,68 @@ pub async fn mcp_handler(
         "forwarding authorized request to upstream"
     );
 
-    let jira = match state.jira.as_ref() {
-        Some(j) => j,
-        None => {
+    // Route to the correct upstream client based on the tool namespace.
+    let forward_result = if params.name.starts_with("confluence_") {
+        let Some(confluence) = state.confluence.as_ref() else {
+            return mcp_error(
+                request.id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "confluence upstream not configured",
+            );
+        };
+        forward(confluence, request.id.clone(), target).await
+    } else {
+        let Some(jira) = state.jira.as_ref() else {
             return mcp_error(
                 request.id,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "upstream not configured",
             );
-        }
+        };
+        forward(jira, request.id.clone(), target).await
     };
 
-    let upstream_request = match jira.request(target.method, &target.path, target.body) {
-        Ok(r) => r,
-        Err(e) => return mcp_error(request.id, StatusCode::BAD_GATEWAY, &e.to_string()),
-    };
+    match forward_result {
+        Ok(response) => response,
+        Err((status, message)) => mcp_error(request.id, status, &message),
+    }
+}
 
-    let upstream_resp = match jira.send(upstream_request).await {
-        Ok(r) => r,
-        Err(e) => {
-            return mcp_error(
-                request.id,
-                StatusCode::BAD_GATEWAY,
-                &format!("upstream request failed: {}", e),
-            );
-        }
-    };
+async fn forward<C: UpstreamClient>(
+    client: &C,
+    request_id: Option<Value>,
+    target: ToolTarget,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
+    let upstream_request = client
+        .build_request(target.method, &target.path, target.body)
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    let upstream_resp = client.execute(upstream_request).await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("upstream request failed: {}", e),
+        )
+    })?;
 
     let upstream_status = upstream_resp.status();
-    let upstream_body = match upstream_resp.json::<Value>().await {
-        Ok(v) => v,
-        Err(e) => {
-            return mcp_error(
-                request.id,
-                StatusCode::BAD_GATEWAY,
-                &format!("failed to read upstream: {}", e),
-            );
-        }
-    };
+    let upstream_body = upstream_resp.json::<Value>().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to read upstream: {}", e),
+        )
+    })?;
 
     let (status, envelope) = if upstream_status.is_success() {
         (
             StatusCode::OK,
-            json!({"jsonrpc":"2.0","id": request.id, "result": upstream_body}),
+            json!({"jsonrpc":"2.0","id": request_id, "result": upstream_body}),
         )
     } else {
         (
             StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             json!({
                 "jsonrpc": "2.0",
-                "id": request.id,
+                "id": request_id,
                 "error": {
                     "code": -32000,
                     "message": format!("upstream returned {}", upstream_status),
@@ -243,7 +256,7 @@ pub async fn mcp_handler(
         )
     };
 
-    (status, Json(envelope))
+    Ok((status, Json(envelope)))
 }
 
 fn mcp_error(id: Option<Value>, status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
@@ -287,6 +300,31 @@ fn resolve_target(tool: &str, args: Option<&Value>) -> Result<ToolTarget, String
                 body: Some(args.clone()),
             })
         }
+        "confluence_get_page" => {
+            let args = args.ok_or("missing arguments")?;
+            let space = args
+                .get("space")
+                .and_then(|v| v.as_str())
+                .ok_or("missing space")?
+                .to_string();
+            if space.is_empty() {
+                return Err("space must not be empty".into());
+            }
+            let page_id = args
+                .get("page_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing page_id")?;
+            if page_id.is_empty() || !page_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err("page_id must be a non-empty numeric id".into());
+            }
+            Ok(ToolTarget {
+                project: None,
+                space: Some(space),
+                method: Method::GET,
+                path: format!("/wiki/api/v2/pages/{page_id}?body-format=view"),
+                body: None,
+            })
+        }
         _ => Err("unsupported tool".into()),
     }
 }
@@ -297,6 +335,7 @@ mod tests {
     use crate::agents::AgentConfig;
     use crate::audit::AuditLog;
     use crate::config::{AtlassianConfig, AuditConfig, Config, McpConfig};
+    use crate::confluence::ConfluenceClient;
     use crate::secrets::SecretString;
     use crate::upstream::JiraClient;
     use axum::body::Body;
@@ -335,6 +374,31 @@ mod tests {
                 tools: vec!["jira_get_issue".into(), "jira_create_issue".into()],
                 projects: vec!["PROJ".into()],
                 spaces: vec![],
+                enable_writes,
+            }],
+        }
+    }
+
+    fn confluence_test_config(
+        base_url: String,
+        enable_writes: bool,
+        audit_path: Option<String>,
+        spaces: Vec<String>,
+    ) -> Config {
+        Config {
+            port: 0,
+            atlassian: Some(AtlassianConfig {
+                base_url: Some(base_url),
+                token: Some(SecretString::new("test-token")),
+            }),
+            mcp: McpConfig::default(),
+            audit: AuditConfig { path: audit_path },
+            agents: vec![AgentConfig {
+                id: "demo".into(),
+                keys: vec![SecretString::new("agent-key")],
+                tools: vec!["confluence_get_page".into()],
+                projects: vec![],
+                spaces,
                 enable_writes,
             }],
         }
@@ -404,12 +468,45 @@ mod tests {
         (port, captured)
     }
 
+    async fn mock_confluence_server() -> (u16, Arc<Mutex<Vec<HeaderMap>>>) {
+        #[derive(Clone)]
+        struct MockState {
+            headers: Arc<Mutex<Vec<HeaderMap>>>,
+        }
+
+        let state = MockState {
+            headers: Arc::new(Mutex::new(Vec::new())),
+        };
+        let captured = state.headers.clone();
+
+        let get_handler =
+            |State(s): State<MockState>, Path(id): Path<String>, headers: HeaderMap| async move {
+                s.headers.lock().unwrap().push(headers);
+                Json(json!({
+                    "id": id,
+                    "title": "Demo Page",
+                    "spaceId": "12345",
+                    "body": { "view": { "value": "<p>Hello</p>" } }
+                }))
+            };
+
+        let app = Router::new()
+            .route("/wiki/api/v2/pages/{id}", get(get_handler))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, captured)
+    }
+
     #[tokio::test]
     async fn mcp_missing_key_returns_401() {
         let state = AppState {
             start: Instant::now(),
             config: test_config("http://localhost:0".into(), false, None),
             jira: None,
+            confluence: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -430,6 +527,7 @@ mod tests {
             start: Instant::now(),
             config: test_config("http://localhost:0".into(), false, None),
             jira: None,
+            confluence: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -453,6 +551,7 @@ mod tests {
             start: Instant::now(),
             config,
             jira: Some(jira),
+            confluence: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -476,6 +575,7 @@ mod tests {
             start: Instant::now(),
             config,
             jira: Some(jira),
+            confluence: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -517,6 +617,7 @@ mod tests {
             start: Instant::now(),
             config,
             jira: Some(jira),
+            confluence: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -540,6 +641,7 @@ mod tests {
             start: Instant::now(),
             config,
             jira: Some(jira),
+            confluence: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -569,6 +671,7 @@ mod tests {
             start: Instant::now(),
             config,
             jira: Some(jira),
+            confluence: None,
             audit,
         };
         let app = crate::router(state);
@@ -623,6 +726,7 @@ mod tests {
             start: Instant::now(),
             config,
             jira: Some(jira),
+            confluence: None,
             audit,
         };
         let app = crate::router(state);
@@ -648,6 +752,7 @@ mod tests {
             start: Instant::now(),
             config,
             jira: Some(jira),
+            confluence: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -659,6 +764,141 @@ mod tests {
             ))
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_get_page_allows_and_strips_headers() {
+        let (port, captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_get_page",
+                json!({"space":"SPACE","page_id":"12345"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["title"], "Demo Page");
+
+        let upstream_headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            upstream_headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer test-token"
+        );
+        assert!(!upstream_headers.contains_key("x-atlapool-key"));
+        assert!(!upstream_headers.contains_key("cookie"));
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_get_page_forbidden_space_returns_403() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_get_page",
+                json!({"space":"OTHER","page_id":"12345"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_upstream_not_configured_returns_503() {
+        let config = confluence_test_config(
+            "http://127.0.0.1:0".into(),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_get_page",
+                json!({"space":"SPACE","page_id":"12345"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_get_page_rejects_invalid_page_id() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_get_page",
+                json!({"space":"SPACE","page_id":"12345/abc"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
