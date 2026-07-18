@@ -3,7 +3,8 @@ port = 8080
 # Secret reference formats:
 #   "env:VAR_NAME"                                    — from environment variable
 #   "aws:secretsmanager:<secret-id>"                  — from AWS Secrets Manager (plain string secret)
-#   "gcp:secretmanager:projects/<project>/secrets/<secret>/versions/latest" — from GCP Secret Manager
+#   "gcp:secretmanager:<project>/<secret>"            — from GCP Secret Manager (latest version)
+#   "gcp:secretmanager:projects/<project>/secrets/<secret>/versions/<version>" — from GCP Secret Manager
 #
 # <secret-id> can be a secret name or a full ARN. The returned secret string
 # is used as-is; JSON sub-key extraction is not supported yet.
@@ -12,6 +13,7 @@ port = 8080
 # base_url = "https://your-domain.atlassian.net"
 # token = "env:ATLASSIAN_TOKEN"                    # F5-a: env variable
 # token = "aws:secretsmanager:prod/atlassian/token" # F5-b: AWS Secrets Manager
+# token = "gcp:secretmanager:my-project/atlassian-token"  # F5-c: GCP Secret Manager
 
 [mcp]
 enabled = false
