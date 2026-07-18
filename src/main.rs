@@ -30,8 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or_else(|_| "atlapool=info".into());
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    let secrets_backend = secrets::AwsSecretsManager::new().await?;
-    let config = Config::load(&secrets_backend).await?;
+    let config = Config::load().await?;
     let port = config.port;
     let jira = config.atlassian.as_ref().map(JiraClient::new).transpose()?;
     let state = AppState {

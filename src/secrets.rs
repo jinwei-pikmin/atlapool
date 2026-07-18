@@ -108,6 +108,34 @@ impl SecretBackend for AwsSecretsManager {
     }
 }
 
+/// Lazily creates an `AwsSecretsManager` only when an `aws:secretsmanager:`
+/// reference is actually encountered. This keeps `env:`-only deployments free
+/// from any AWS dependency or configuration requirement.
+pub struct LazyAwsBackend {
+    inner: tokio::sync::OnceCell<Result<AwsSecretsManager, SecretError>>,
+}
+
+impl LazyAwsBackend {
+    pub fn new() -> Self {
+        Self {
+            inner: tokio::sync::OnceCell::new(),
+        }
+    }
+}
+
+impl SecretBackend for LazyAwsBackend {
+    async fn get_secret(&self, secret_id: &str) -> Result<String, SecretError> {
+        let init = self
+            .inner
+            .get_or_init(|| async { AwsSecretsManager::new().await })
+            .await;
+        match init {
+            Ok(manager) => manager.get_secret(secret_id).await,
+            Err(err) => Err(err.clone()),
+        }
+    }
+}
+
 /// Resolve a secret reference string.
 ///
 /// Supported formats:

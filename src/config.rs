@@ -56,16 +56,15 @@ fn default_port() -> u16 {
 }
 
 impl Config {
-    pub async fn load<B: SecretBackend>(
-        backend: &B,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn load() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let backend = crate::secrets::LazyAwsBackend::new();
         if let Ok(path) = std::env::var("ATLAPOOL_CONFIG") {
             let content = fs::read_to_string(&path)?;
-            return Self::from_toml(backend, &content).await;
+            return Self::from_toml(&backend, &content).await;
         }
         if Path::new("config.toml").exists() {
             let content = fs::read_to_string("config.toml")?;
-            return Self::from_toml(backend, &content).await;
+            return Self::from_toml(&backend, &content).await;
         }
         Ok(Self::default())
     }
@@ -101,18 +100,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::SecretError;
     use std::io::Write;
-
-    struct DummyBackend;
-
-    impl SecretBackend for DummyBackend {
-        async fn get_secret(&self, _secret_id: &str) -> Result<String, SecretError> {
-            Err(SecretError::Aws(
-                "dummy backend should not be called".into(),
-            ))
-        }
-    }
 
     #[test]
     fn default_config_has_default_port() {
@@ -151,8 +139,7 @@ mod tests {
         std::env::remove_var(var);
         std::env::set_var("ATLAPOOL_CONFIG", &path);
 
-        let backend = DummyBackend;
-        let result = Config::load(&backend).await;
+        let result = Config::load().await;
 
         std::env::remove_var("ATLAPOOL_CONFIG");
         fs::remove_file(&path).ok();
