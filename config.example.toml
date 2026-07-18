@@ -23,11 +23,11 @@ port = 8080
 # token = "gcp:secretmanager:projects/my-project/secrets/atlassian-token/versions/1"
 
 [mcp]
-# Enable/disable the /mcp tools/call endpoint. This only gates the MCP POST;
-# /health and /stats are always available.
+# Reserved fields. The server currently does not gate the /mcp endpoint on
+# `enabled` nor apply a global `enable_writes` default. The /health and /stats
+# endpoints are always available, and write-gating is controlled per-agent via
+# `agents.enable_writes` below.
 enabled = false
-
-# Global default for write tools. Per-agent enable_writes overrides this.
 # enable_writes = false
 
 [audit]
