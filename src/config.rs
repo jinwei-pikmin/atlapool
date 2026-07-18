@@ -45,10 +45,23 @@ pub struct McpConfig {
     pub enable_writes: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct AuditConfig {
+    #[serde(default = "default_audit_path")]
     pub path: Option<String>,
+}
+
+fn default_audit_path() -> Option<String> {
+    Some("atlapool-audit.jsonl".into())
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            path: default_audit_path(),
+        }
+    }
 }
 
 fn default_port() -> u16 {

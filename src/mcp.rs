@@ -127,7 +127,8 @@ pub async fn mcp_handler(
 
     // Write gate: conservative classification. Anything that is not a read prefix
     // is treated as a write and requires enable_writes=true on the agent.
-    if agents::classify_tool(&params.name) == agents::ToolKind::Write && !agent.enable_writes {
+    let is_write = agents::classify_tool(&params.name) == agents::ToolKind::Write;
+    if is_write && !agent.enable_writes {
         tracing::warn!(
             agent_id = %agent.id,
             tool = %params.name,
@@ -138,6 +139,43 @@ pub async fn mcp_handler(
             StatusCode::FORBIDDEN,
             "write tools not enabled for agent",
         );
+    }
+
+    // Fail-closed audit: write operations must be logged before the upstream call.
+    // If the audit log cannot be written, the operation is aborted with 500.
+    if is_write {
+        let Some(audit) = state.audit.as_ref() else {
+            tracing::error!(
+                agent_id = %agent.id,
+                tool = %params.name,
+                "rejected request: audit log not configured"
+            );
+            return mcp_error(
+                request.id,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "audit log not configured",
+            );
+        };
+
+        let target = target
+            .project
+            .as_deref()
+            .or(target.space.as_deref())
+            .unwrap_or("unknown");
+
+        if let Err(e) = audit.record_attempt(&agent.id, &params.name, target).await {
+            tracing::error!(
+                agent_id = %agent.id,
+                tool = %params.name,
+                error = %e,
+                "rejected request: audit log write failed"
+            );
+            return mcp_error(
+                request.id,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "audit log write failed",
+            );
+        }
     }
 
     tracing::info!(
@@ -257,6 +295,7 @@ fn resolve_target(tool: &str, args: Option<&Value>) -> Result<ToolTarget, String
 mod tests {
     use super::*;
     use crate::agents::AgentConfig;
+    use crate::audit::AuditLog;
     use crate::config::{AtlassianConfig, AuditConfig, Config, McpConfig};
     use crate::secrets::SecretString;
     use crate::upstream::JiraClient;
@@ -270,7 +309,18 @@ mod tests {
     use std::time::Instant;
     use tower::ServiceExt;
 
-    fn test_config(base_url: String, enable_writes: bool) -> Config {
+    fn temp_audit_path() -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "atlapool-audit-{}-{}.jsonl",
+                std::process::id(),
+                time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn test_config(base_url: String, enable_writes: bool, audit_path: Option<String>) -> Config {
         Config {
             port: 0,
             atlassian: Some(AtlassianConfig {
@@ -278,7 +328,7 @@ mod tests {
                 token: Some(SecretString::new("test-token")),
             }),
             mcp: McpConfig::default(),
-            audit: AuditConfig::default(),
+            audit: AuditConfig { path: audit_path },
             agents: vec![AgentConfig {
                 id: "demo".into(),
                 keys: vec![SecretString::new("agent-key")],
@@ -358,8 +408,9 @@ mod tests {
     async fn mcp_missing_key_returns_401() {
         let state = AppState {
             start: Instant::now(),
-            config: test_config("http://localhost:0".into(), false),
+            config: test_config("http://localhost:0".into(), false, None),
             jira: None,
+            audit: None,
         };
         let app = crate::router(state);
         let response = app
@@ -377,8 +428,9 @@ mod tests {
     async fn mcp_wrong_key_returns_401() {
         let state = AppState {
             start: Instant::now(),
-            config: test_config("http://localhost:0".into(), false),
+            config: test_config("http://localhost:0".into(), false, None),
             jira: None,
+            audit: None,
         };
         let app = crate::router(state);
         let response = app
@@ -395,12 +447,13 @@ mod tests {
     #[tokio::test]
     async fn mcp_forbidden_project_returns_403() {
         let (port, _headers) = mock_jira_server().await;
-        let config = test_config(format!("http://127.0.0.1:{}", port), false);
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
         let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
         let state = AppState {
             start: Instant::now(),
             config,
             jira: Some(jira),
+            audit: None,
         };
         let app = crate::router(state);
         let response = app
@@ -417,12 +470,13 @@ mod tests {
     #[tokio::test]
     async fn mcp_allows_valid_request_and_strips_client_headers() {
         let (port, captured) = mock_jira_server().await;
-        let config = test_config(format!("http://127.0.0.1:{}", port), false);
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
         let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
         let state = AppState {
             start: Instant::now(),
             config,
             jira: Some(jira),
+            audit: None,
         };
         let app = crate::router(state);
         let response = app
@@ -457,12 +511,13 @@ mod tests {
     #[tokio::test]
     async fn mcp_read_tool_works_when_writes_disabled() {
         let (port, _captured) = mock_jira_server().await;
-        let config = test_config(format!("http://127.0.0.1:{}", port), false);
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
         let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
         let state = AppState {
             start: Instant::now(),
             config,
             jira: Some(jira),
+            audit: None,
         };
         let app = crate::router(state);
         let response = app
@@ -479,12 +534,13 @@ mod tests {
     #[tokio::test]
     async fn mcp_write_tool_denied_when_writes_disabled() {
         let (port, _captured) = mock_jira_server().await;
-        let config = test_config(format!("http://127.0.0.1:{}", port), false);
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
         let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
         let state = AppState {
             start: Instant::now(),
             config,
             jira: Some(jira),
+            audit: None,
         };
         let app = crate::router(state);
         let response = app
@@ -499,14 +555,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_write_tool_allowed_when_writes_enabled() {
+    async fn mcp_write_tool_allowed_and_audited_when_writes_enabled() {
         let (port, _captured) = mock_jira_server().await;
-        let config = test_config(format!("http://127.0.0.1:{}", port), true);
+        let config = test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            Some(temp_audit_path()),
+        );
+        let audit_path = config.audit.path.clone().unwrap();
+        let audit = Some(AuditLog::new(audit_path.clone()));
         let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
         let state = AppState {
             start: Instant::now(),
             config,
             jira: Some(jira),
+            audit,
         };
         let app = crate::router(state);
         let response = app
@@ -524,17 +587,68 @@ mod tests {
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["result"]["key"], "PROJ-123");
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        let line = log.trim();
+        assert!(line.contains("\"agent_id\":\"demo\""));
+        assert!(line.contains("\"tool\":\"jira_create_issue\""));
+        assert!(line.contains("\"target\":\"PROJ\""));
+        assert!(line.contains("\"result\":\"attempt\""));
+
+        std::fs::remove_file(&audit_path).ok();
     }
 
     #[tokio::test]
-    async fn mcp_unknown_tool_returns_explicit_error() {
-        let (port, _captured) = mock_jira_server().await;
-        let config = test_config(format!("http://127.0.0.1:{}", port), false);
+    async fn mcp_write_tool_rejected_when_audit_write_fails() {
+        let (port, captured) = mock_jira_server().await;
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        let bad_path = std::env::temp_dir()
+            .join(format!("nonexistent-dir-{unique}"))
+            .join("atlapool-audit.jsonl")
+            .to_string_lossy()
+            .into_owned();
+
+        let config = test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            Some(bad_path.clone()),
+        );
+        let audit = Some(AuditLog::new(bad_path));
         let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
         let state = AppState {
             start: Instant::now(),
             config,
             jira: Some(jira),
+            audit,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_create_issue",
+                json!({"project":"PROJ","summary":"stub"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_unknown_tool_returns_explicit_error() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            audit: None,
         };
         let app = crate::router(state);
         let response = app
