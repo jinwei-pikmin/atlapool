@@ -80,7 +80,8 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
-    async fn healthz_returns_ok() {
+    async fn healthz_returns_ok_without_external_checks() {
+        // /healthz must stay alive even when no upstream (Jira) or audit is configured.
         let app = router(AppState {
             start: Instant::now(),
             config: Config::default(),
@@ -96,6 +97,12 @@ mod tests {
             )
             .await
             .unwrap();
+
         assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json, serde_json::json!({"status": "ok"}));
     }
 }
