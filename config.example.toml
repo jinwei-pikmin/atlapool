@@ -1,13 +1,17 @@
 port = 8080
 
 # Secret reference formats:
-#   "env:VAR_NAME"                                  — from environment variable
-#   "aws:secretsmanager:secret-name:json-key"       — from AWS Secrets Manager (JSON key)
+#   "env:VAR_NAME"                                    — from environment variable
+#   "aws:secretsmanager:<secret-id>"                  — from AWS Secrets Manager (plain string secret)
 #   "gcp:secretmanager:projects/<project>/secrets/<secret>/versions/latest" — from GCP Secret Manager
+#
+# <secret-id> can be a secret name or a full ARN. The returned secret string
+# is used as-is; JSON sub-key extraction is not supported yet.
 
 [atlassian]
 # base_url = "https://your-domain.atlassian.net"
-# token = "env:ATLASSIAN_TOKEN"   # F5-a 僅支援 env:；aws:/gcp: 後續 Issue 實作
+# token = "env:ATLASSIAN_TOKEN"                    # F5-a: env variable
+# token = "aws:secretsmanager:prod/atlassian/token" # F5-b: AWS Secrets Manager
 
 [mcp]
 enabled = false
@@ -19,6 +23,7 @@ enabled = false
 # [[agents]]
 # id = "demo-agent"
 # keys = ["env:ATLAPOOL_KEY_DEMO"]
+# keys = ["aws:secretsmanager:prod/atlapool/agent-key"]
 # projects = ["PROJ-X", "PROJ/*"]   # '*' matches any sequence, including path separators
 # spaces = ["SPACE-Y", "SPACE/*"]
 # tools = ["jira_get_issue", "jira_search_issues", "confluence_read_page", "jira_create_issue"]

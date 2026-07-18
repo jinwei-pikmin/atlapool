@@ -1,3 +1,4 @@
+use crate::secrets::SecretBackend;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -55,41 +56,42 @@ fn default_port() -> u16 {
 }
 
 impl Config {
-    pub fn load() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn load() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let backend = crate::secrets::LazyAwsBackend::new();
         if let Ok(path) = std::env::var("ATLAPOOL_CONFIG") {
             let content = fs::read_to_string(&path)?;
-            return Self::from_toml(&content);
+            return Self::from_toml(&backend, &content).await;
         }
         if Path::new("config.toml").exists() {
             let content = fs::read_to_string("config.toml")?;
-            return Self::from_toml(&content);
+            return Self::from_toml(&backend, &content).await;
         }
         Ok(Self::default())
     }
 
-    fn from_toml(content: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    async fn from_toml<B: SecretBackend>(
+        backend: &B,
+        content: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut config: Config = toml::from_str(content)?;
         if let Some(ref mut atlassian) = config.atlassian {
             if let Some(token) = atlassian.token.as_ref() {
-                let resolved = crate::secrets::resolve(token.expose_secret())?;
+                let resolved = crate::secrets::resolve(backend, token.expose_secret()).await?;
                 atlassian.token = Some(crate::secrets::SecretString::new(resolved));
             }
         }
         for agent in &mut config.agents {
-            agent.keys = agent
-                .keys
-                .iter()
-                .map(|k| {
-                    let s = k.expose_secret();
-                    if s.starts_with("env:") {
-                        Ok(crate::secrets::SecretString::new(crate::secrets::resolve(
-                            s,
-                        )?))
-                    } else {
-                        Ok(k.clone())
-                    }
-                })
-                .collect::<Result<Vec<_>, crate::secrets::SecretError>>()?;
+            let mut resolved_keys = Vec::with_capacity(agent.keys.len());
+            for k in &agent.keys {
+                let s = k.expose_secret();
+                if s.starts_with("env:") || s.starts_with("aws:secretsmanager:") {
+                    let value = crate::secrets::resolve(backend, s).await?;
+                    resolved_keys.push(crate::secrets::SecretString::new(value));
+                } else {
+                    resolved_keys.push(k.clone());
+                }
+            }
+            agent.keys = resolved_keys;
         }
         Ok(config)
     }
@@ -121,8 +123,8 @@ mod tests {
         assert!(debug.contains("<redacted>"));
     }
 
-    #[test]
-    fn load_fails_when_env_secret_missing() {
+    #[tokio::test]
+    async fn load_fails_when_env_secret_missing() {
         let var = "ATLAPOOL_TEST_CONFIG_MISSING_TOKEN";
         let path = std::env::temp_dir().join(format!(
             "atlapool-config-missing-{}.toml",
@@ -137,7 +139,7 @@ mod tests {
         std::env::remove_var(var);
         std::env::set_var("ATLAPOOL_CONFIG", &path);
 
-        let result = Config::load();
+        let result = Config::load().await;
 
         std::env::remove_var("ATLAPOOL_CONFIG");
         fs::remove_file(&path).ok();
