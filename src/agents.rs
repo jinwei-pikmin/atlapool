@@ -12,6 +12,31 @@ pub struct AgentConfig {
     pub projects: Vec<String>,
     #[serde(default)]
     pub spaces: Vec<String>,
+    #[serde(default)]
+    pub enable_writes: bool,
+}
+
+/// Tool classification for write-gate decisions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolKind {
+    Read,
+    Write,
+}
+
+/// Classify a tool name into Read or Write.
+///
+/// Tools whose name contains a read verb (`get`, `list`, `search`, `read`)
+/// as a `_`-delimited segment are treated as read operations. Everything else —
+/// including unknown tool names — is conservatively treated as a write operation.
+pub fn classify_tool(tool: &str) -> ToolKind {
+    let is_read = tool
+        .split('_')
+        .any(|segment| matches!(segment, "get" | "list" | "search" | "read"));
+    if is_read {
+        ToolKind::Read
+    } else {
+        ToolKind::Write
+    }
 }
 
 impl AgentConfig {
@@ -55,7 +80,11 @@ pub fn find_agent<'a>(agents: &'a [AgentConfig], key: &str) -> Option<&'a AgentC
     agents.iter().find(|a| {
         a.keys.iter().any(|k| {
             let secret_hash = Sha256::digest(k.expose_secret().as_bytes());
-            key_hash.as_slice().ct_eq(secret_hash.as_slice()).unwrap_u8() == 1
+            key_hash
+                .as_slice()
+                .ct_eq(secret_hash.as_slice())
+                .unwrap_u8()
+                == 1
         })
     })
 }
@@ -108,6 +137,7 @@ mod tests {
             tools: vec!["jira_search_issues".into(), "confluence_read_page".into()],
             projects: vec!["PROJ".into(), "PROJ/*".into()],
             spaces: vec!["SPACE".into(), "SPACE/*".into()],
+            enable_writes: false,
         }
     }
 
@@ -177,6 +207,7 @@ mod tests {
             tools: vec!["cross_tool".into()],
             projects: vec!["PROJ".into()],
             spaces: vec![],
+            enable_writes: false,
         };
         // Project resolves and matches, even though space is unresolved.
         assert!(agent.authorize("cross_tool", Some("PROJ"), None));
@@ -200,5 +231,20 @@ mod tests {
         assert!(glob_match("PROJ/*", "PROJ/123"));
         assert!(glob_match("PROJ/*", "PROJ/123/sub"));
         assert!(!glob_match("PROJ/*", "PROJX"));
+    }
+
+    #[test]
+    fn classify_tool_read_prefixes() {
+        assert_eq!(classify_tool("jira_get_issue"), ToolKind::Read);
+        assert_eq!(classify_tool("confluence_list_comments"), ToolKind::Read);
+        assert_eq!(classify_tool("jira_search_issues"), ToolKind::Read);
+        assert_eq!(classify_tool("confluence_read_page"), ToolKind::Read);
+    }
+
+    #[test]
+    fn classify_tool_write_or_unknown() {
+        assert_eq!(classify_tool("jira_create_issue"), ToolKind::Write);
+        assert_eq!(classify_tool("confluence_delete_page"), ToolKind::Write);
+        assert_eq!(classify_tool("jira_unknown_tool"), ToolKind::Write);
     }
 }

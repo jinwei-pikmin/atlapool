@@ -82,7 +82,9 @@ impl Config {
                 .map(|k| {
                     let s = k.expose_secret();
                     if s.starts_with("env:") {
-                        Ok(crate::secrets::SecretString::new(crate::secrets::resolve(s)?))
+                        Ok(crate::secrets::SecretString::new(crate::secrets::resolve(
+                            s,
+                        )?))
                     } else {
                         Ok(k.clone())
                     }
@@ -122,7 +124,10 @@ mod tests {
     #[test]
     fn load_fails_when_env_secret_missing() {
         let var = "ATLAPOOL_TEST_CONFIG_MISSING_TOKEN";
-        let path = std::env::temp_dir().join(format!("atlapool-config-missing-{}.toml", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "atlapool-config-missing-{}.toml",
+            std::process::id()
+        ));
 
         let mut file = fs::File::create(&path).unwrap();
         writeln!(file, "port = 8080").unwrap();
@@ -137,8 +142,15 @@ mod tests {
         std::env::remove_var("ATLAPOOL_CONFIG");
         fs::remove_file(&path).ok();
 
-        assert!(result.is_err(), "missing env var should cause Config::load to fail");
+        assert!(
+            result.is_err(),
+            "missing env var should cause Config::load to fail"
+        );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("env var"), "error should mention env var: {}", err);
+        assert!(
+            err.contains("env var"),
+            "error should mention env var: {}",
+            err
+        );
     }
 }

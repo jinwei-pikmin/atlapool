@@ -52,18 +52,25 @@ impl JiraClient {
     /// Build a request from an empty header set, injecting only the server
     /// bearer token. F2-a uses Bearer injection; the exact Atlassian auth scheme
     /// (Basic/OAuth) will be aligned in F2-b.
-    pub fn request(&self, method: Method, path: &str) -> Result<reqwest::Request, UpstreamError> {
+    pub fn request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<reqwest::Request, UpstreamError> {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let url = Url::parse(&url).map_err(|_| UpstreamError::InvalidUrl(url.clone()))?;
 
-        self.client
-            .request(method, url)
-            .header(
-                header::AUTHORIZATION,
-                format!("Bearer {}", self.token.expose_secret()),
-            )
-            .build()
-            .map_err(UpstreamError::RequestBuild)
+        let mut builder = self.client.request(method, url).header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", self.token.expose_secret()),
+        );
+
+        if let Some(body) = body {
+            builder = builder.json(&body);
+        }
+
+        builder.build().map_err(UpstreamError::RequestBuild)
     }
 
     pub async fn send(
@@ -75,12 +82,12 @@ impl JiraClient {
 
     #[allow(dead_code)]
     pub fn myself_request(&self) -> Result<reqwest::Request, UpstreamError> {
-        self.request(Method::GET, "/rest/api/3/myself")
+        self.request(Method::GET, "/rest/api/3/myself", None)
     }
 
     #[allow(dead_code)]
     pub fn get_issue_request(&self, issue_key: &str) -> Result<reqwest::Request, UpstreamError> {
-        self.request(Method::GET, &format!("/rest/api/3/issue/{issue_key}"))
+        self.request(Method::GET, &format!("/rest/api/3/issue/{issue_key}"), None)
     }
 }
 
@@ -135,7 +142,12 @@ mod tests {
 
         assert_eq!(request.method(), Method::GET);
         assert_eq!(request.url().path(), "/rest/api/3/issue/PROJ-123");
-        let auth = request.headers().get(AUTHORIZATION).unwrap().to_str().unwrap();
+        let auth = request
+            .headers()
+            .get(AUTHORIZATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(auth, "Bearer test-token");
     }
 }
