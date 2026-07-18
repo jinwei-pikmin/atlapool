@@ -18,7 +18,7 @@ atlapool 需要從 config 解析 Service Account credential，且 credential 不
 
 - 正向：符合 credential 不落地（G1）、fail-closed（解析失敗即退出）、可擴充。
 - 風險：`resolve` 目前為同步；aws/gcp 後端將來若需非同步 I/O，屆時再重構成 async trait。
-- config 檔案未設定 `[atlassian]` 或 `token` 時，視為未啟用 upstream credential，伺服器仍可啟動（方便 healthz 測試）。
+- config 檔案未設定 `[atlassian]` 或 `token` 時，視為未啟用 upstream credential，伺服器仍可啟動（方便 /health 測試）。
 
 ## 參考
 

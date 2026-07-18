@@ -10,5 +10,5 @@ COPY --from=builder /app/target/release/atlapool /atlapool
 ENV PORT=8080
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -sf http://localhost:$PORT/healthz || exit 1
+  CMD curl -sf http://localhost:$PORT/health || exit 1
 ENTRYPOINT ["/atlapool"]

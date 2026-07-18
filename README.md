@@ -13,7 +13,7 @@ cp config.example.toml config.toml
 cargo run
 # Listening on 0.0.0.0:8080
 
-curl http://localhost:8080/healthz
+curl http://localhost:8080/health
 curl http://localhost:8080/stats
 ```
 
