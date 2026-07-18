@@ -32,11 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let config = Config::load()?;
     let port = config.port;
-    let jira = config
-        .atlassian
-        .as_ref()
-        .map(JiraClient::new)
-        .transpose()?;
+    let jira = config.atlassian.as_ref().map(JiraClient::new).transpose()?;
     let state = AppState {
         start: Instant::now(),
         config: config.clone(),
@@ -82,7 +78,12 @@ mod tests {
             jira: None,
         });
         let response = app
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);

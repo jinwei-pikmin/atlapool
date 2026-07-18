@@ -41,7 +41,10 @@ impl fmt::Display for SecretError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SecretError::Unsupported => {
-                write!(f, "unsupported secret reference format (F5-a only supports env:VAR_NAME)")
+                write!(
+                    f,
+                    "unsupported secret reference format (F5-a only supports env:VAR_NAME)"
+                )
             }
             SecretError::MissingEnv(var) => write!(f, "env var '{}' is not set", var),
         }
