@@ -20,6 +20,7 @@ enabled = false
 # session_ttl_secs = 3600
 
 [audit]
+# F7: JSONL audit log for write operations. Defaults to atlapool-audit.jsonl in cwd.
 # path = "/var/lib/atlapool/audit.jsonl"
 
 # [[agents]]

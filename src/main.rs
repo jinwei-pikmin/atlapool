@@ -1,4 +1,5 @@
 mod agents;
+mod audit;
 mod config;
 mod mcp;
 mod secrets;
@@ -22,6 +23,7 @@ struct AppState {
     start: Instant,
     config: Config,
     jira: Option<JiraClient>,
+    audit: Option<crate::audit::AuditLog>,
 }
 
 #[tokio::main]
@@ -33,10 +35,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::load().await?;
     let port = config.port;
     let jira = config.atlassian.as_ref().map(JiraClient::new).transpose()?;
+    let audit_path = config
+        .audit
+        .path
+        .clone()
+        .unwrap_or_else(|| "atlapool-audit.jsonl".into());
+    let audit = Some(crate::audit::AuditLog::new(audit_path));
     let state = AppState {
         start: Instant::now(),
         config: config.clone(),
         jira,
+        audit,
     };
     let app = router(state);
 
@@ -76,6 +85,7 @@ mod tests {
             start: Instant::now(),
             config: Config::default(),
             jira: None,
+            audit: None,
         });
         let response = app
             .oneshot(
