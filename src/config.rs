@@ -29,7 +29,7 @@ impl Default for Config {
 #[allow(dead_code)]
 pub struct AtlassianConfig {
     pub base_url: Option<String>,
-    pub token: Option<String>,
+    pub token: Option<crate::secrets::SecretString>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -68,8 +68,8 @@ impl Config {
         let mut config: Config = toml::from_str(content)?;
         if let Some(ref mut atlassian) = config.atlassian {
             if let Some(token) = atlassian.token.as_ref() {
-                let resolved = crate::secrets::resolve(token)?;
-                atlassian.token = Some(resolved);
+                let resolved = crate::secrets::resolve(token.expose_secret())?;
+                atlassian.token = Some(crate::secrets::SecretString::new(resolved));
             }
         }
         Ok(config)
@@ -79,10 +79,49 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn default_config_has_default_port() {
         let config = Config::default();
         assert_eq!(config.port, 8080);
+    }
+
+    #[test]
+    fn config_debug_redacts_secret_token() {
+        let config = Config {
+            atlassian: Some(AtlassianConfig {
+                base_url: Some("https://example.atlassian.net".into()),
+                token: Some(crate::secrets::SecretString::new("env:SOME_VAR")),
+            }),
+            ..Config::default()
+        };
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("example.atlassian.net"));
+        assert!(!debug.contains("env:SOME_VAR"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn load_fails_when_env_secret_missing() {
+        let var = "ATLAPOOL_TEST_CONFIG_MISSING_TOKEN";
+        let path = std::env::temp_dir().join(format!("atlapool-config-missing-{}.toml", std::process::id()));
+
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(file, "port = 8080").unwrap();
+        writeln!(file, "\n[atlassian]").unwrap();
+        writeln!(file, "token = \"env:{}\"", var).unwrap();
+
+        std::env::remove_var(var);
+        std::env::set_var("ATLAPOOL_CONFIG", &path);
+
+        let result = Config::load();
+
+        std::env::remove_var("ATLAPOOL_CONFIG");
+        fs::remove_file(&path).ok();
+
+        assert!(result.is_err(), "missing env var should cause Config::load to fail");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("env var"), "error should mention env var: {}", err);
     }
 }

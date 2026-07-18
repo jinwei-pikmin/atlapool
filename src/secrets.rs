@@ -1,4 +1,35 @@
+use serde::Deserialize;
 use std::fmt;
+
+/// A string that masks its value in `Debug` and `Display` to prevent
+/// accidental credential leakage in logs or panic messages.
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    /// Access the raw secret value. Call sites should make it obvious that
+    /// they are handling a credential and must not log or expose it.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl fmt::Display for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum SecretError {
@@ -33,6 +64,14 @@ pub fn resolve(reference: &str) -> Result<String, SecretError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_string_debug_and_display_redact() {
+        let secret = SecretString::new("top-secret");
+        assert_eq!(format!("{:?}", secret), "<redacted>");
+        assert_eq!(format!("{}", secret), "<redacted>");
+        assert_eq!(secret.expose_secret(), "top-secret");
+    }
 
     #[test]
     fn resolve_env_ok() {
