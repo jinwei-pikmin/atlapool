@@ -7,7 +7,7 @@ port = 8080
 
 [atlassian]
 # base_url = "https://your-domain.atlassian.net"
-# token = "env:ATLASSIAN_TOKEN"
+# token = "env:ATLASSIAN_TOKEN"   # F5-a 僅支援 env:；aws:/gcp: 後續 Issue 實作
 
 [mcp]
 enabled = false
