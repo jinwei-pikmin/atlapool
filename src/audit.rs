@@ -57,7 +57,6 @@ impl AuditLog {
 
         Ok(())
     }
-
 }
 
 fn rfc3339_now() -> String {
