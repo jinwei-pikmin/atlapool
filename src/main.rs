@@ -1,13 +1,13 @@
-#[allow(dead_code)]
 mod agents;
 mod config;
+mod mcp;
 mod secrets;
 mod upstream;
 
 use axum::{
     extract::State,
     response::Json,
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use config::Config;
@@ -15,11 +15,13 @@ use serde_json::json;
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tracing::info;
+use upstream::JiraClient;
 
 #[derive(Clone)]
 struct AppState {
     start: Instant,
     config: Config,
+    jira: Option<JiraClient>,
 }
 
 #[tokio::main]
@@ -30,9 +32,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let config = Config::load()?;
     let port = config.port;
+    let jira = config
+        .atlassian
+        .as_ref()
+        .map(JiraClient::new)
+        .transpose()?;
     let state = AppState {
         start: Instant::now(),
         config: config.clone(),
+        jira,
     };
     let app = router(state);
 
@@ -46,6 +54,7 @@ fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
+        .route("/mcp", post(mcp::mcp_handler))
         .with_state(state)
 }
 
@@ -70,6 +79,7 @@ mod tests {
         let app = router(AppState {
             start: Instant::now(),
             config: Config::default(),
+            jira: None,
         });
         let response = app
             .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())

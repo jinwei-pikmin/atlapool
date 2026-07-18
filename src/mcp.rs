@@ -1,0 +1,367 @@
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    Json,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::{agents, AppState};
+
+const MCP_KEY_HEADER: &str = "x-atlapool-key";
+
+#[derive(Deserialize)]
+struct McpRequest {
+    #[serde(default)]
+    jsonrpc: String,
+    id: Option<Value>,
+    method: String,
+    #[serde(default)]
+    params: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct McpToolParams {
+    name: String,
+    #[serde(default)]
+    arguments: Option<Value>,
+}
+
+struct ToolTarget {
+    project: Option<String>,
+    space: Option<String>,
+    path: String,
+}
+
+pub async fn mcp_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let key = headers
+        .get(MCP_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty());
+
+    let Some(key) = key else {
+        return mcp_error(None, StatusCode::UNAUTHORIZED, "missing or empty X-Atlapool-Key");
+    };
+
+    let agent = match agents::find_agent(&state.config.agents, key) {
+        Some(a) => a,
+        None => {
+            tracing::warn!("rejected request: unknown X-Atlapool-Key");
+            return mcp_error(None, StatusCode::UNAUTHORIZED, "unknown key");
+        }
+    };
+
+    let request: McpRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return mcp_error(None, StatusCode::BAD_REQUEST, &format!("invalid JSON: {}", e)),
+    };
+
+    if request.jsonrpc != "2.0" {
+        return mcp_error(request.id, StatusCode::BAD_REQUEST, "jsonrpc must be 2.0");
+    }
+
+    if request.method != "tools/call" {
+        return mcp_error(request.id, StatusCode::NOT_IMPLEMENTED, "method not supported");
+    }
+
+    let params: McpToolParams = match request.params {
+        Some(v) => match serde_json::from_value(v) {
+            Ok(p) => p,
+            Err(e) => {
+                return mcp_error(request.id, StatusCode::BAD_REQUEST, &format!("invalid params: {}", e));
+            }
+        },
+        None => return mcp_error(request.id, StatusCode::BAD_REQUEST, "missing params"),
+    };
+
+    let target = match resolve_target(&params.name, params.arguments.as_ref()) {
+        Ok(t) => t,
+        Err(msg) => return mcp_error(request.id, StatusCode::BAD_REQUEST, &msg),
+    };
+
+    if !agent.authorize(&params.name, target.project.as_deref(), target.space.as_deref()) {
+        tracing::warn!(
+            agent_id = %agent.id,
+            tool = %params.name,
+            "rejected request: agent policy denies tool"
+        );
+        return mcp_error(request.id, StatusCode::FORBIDDEN, "not permitted by agent policy");
+    }
+
+    tracing::info!(
+        agent_id = %agent.id,
+        tool = %params.name,
+        "forwarding authorized request to upstream"
+    );
+
+    let jira = match state.jira.as_ref() {
+        Some(j) => j,
+        None => {
+            return mcp_error(
+                request.id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream not configured",
+            );
+        }
+    };
+
+    let upstream_request = match jira.request(reqwest::Method::GET, &target.path) {
+        Ok(r) => r,
+        Err(e) => return mcp_error(request.id, StatusCode::BAD_GATEWAY, &e.to_string()),
+    };
+
+    let upstream_resp = match jira.send(upstream_request).await {
+        Ok(r) => r,
+        Err(e) => {
+            return mcp_error(
+                request.id,
+                StatusCode::BAD_GATEWAY,
+                &format!("upstream request failed: {}", e),
+            );
+        }
+    };
+
+    let upstream_status = upstream_resp.status();
+    let upstream_body = match upstream_resp.json::<Value>().await {
+        Ok(v) => v,
+        Err(e) => {
+            return mcp_error(
+                request.id,
+                StatusCode::BAD_GATEWAY,
+                &format!("failed to read upstream: {}", e),
+            );
+        }
+    };
+
+    let (status, envelope) = if upstream_status.is_success() {
+        (
+            StatusCode::OK,
+            json!({"jsonrpc":"2.0","id": request.id, "result": upstream_body}),
+        )
+    } else {
+        (
+            StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            json!({
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "error": {
+                    "code": -32000,
+                    "message": format!("upstream returned {}", upstream_status),
+                    "data": upstream_body
+                }
+            }),
+        )
+    };
+
+    (status, Json(envelope))
+}
+
+fn mcp_error(id: Option<Value>, status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32000, "message": message }
+    });
+    (status, Json(body))
+}
+
+fn resolve_target(tool: &str, args: Option<&Value>) -> Result<ToolTarget, String> {
+    match tool {
+        "jira_get_issue" => {
+            let args = args.ok_or("missing arguments")?;
+            let issue_key = args
+                .get("issue_key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing issue_key")?;
+            let project = issue_key.split_once('-').map(|(p, _)| p.to_string());
+            Ok(ToolTarget {
+                project,
+                space: None,
+                path: format!("/rest/api/3/issue/{issue_key}"),
+            })
+        }
+        _ => Ok(ToolTarget {
+            project: None,
+            space: None,
+            path: String::new(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::AgentConfig;
+    use crate::config::{AtlassianConfig, AuditConfig, Config, McpConfig};
+    use crate::secrets::SecretString;
+    use crate::upstream::JiraClient;
+    use axum::body::Body;
+    use axum::extract::Path;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+    use tower::ServiceExt;
+
+    fn test_config(base_url: String) -> Config {
+        Config {
+            port: 0,
+            atlassian: Some(AtlassianConfig {
+                base_url: Some(base_url),
+                token: Some(SecretString::new("test-token")),
+            }),
+            mcp: McpConfig::default(),
+            audit: AuditConfig::default(),
+            agents: vec![AgentConfig {
+                id: "demo".into(),
+                keys: vec![SecretString::new("agent-key")],
+                tools: vec!["jira_get_issue".into()],
+                projects: vec!["PROJ".into()],
+                spaces: vec![],
+            }],
+        }
+    }
+
+    fn build_request(key: Option<&str>, issue_key: &str) -> Request<Body> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "jira_get_issue",
+                "arguments": { "issue_key": issue_key }
+            }
+        })
+        .to_string();
+
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json");
+
+        if let Some(k) = key {
+            builder = builder.header("X-Atlapool-Key", k);
+        }
+        // A sensitive header that must never reach the upstream Jira server.
+        builder = builder.header("cookie", "session=bad");
+        builder.body(Body::from(body)).unwrap()
+    }
+
+    async fn mock_jira_server() -> (u16, Arc<Mutex<Vec<HeaderMap>>>) {
+        #[derive(Clone)]
+        struct MockState {
+            headers: Arc<Mutex<Vec<HeaderMap>>>,
+        }
+
+        let state = MockState {
+            headers: Arc::new(Mutex::new(Vec::new())),
+        };
+        let captured = state.headers.clone();
+
+        let app = Router::new()
+            .route(
+                "/rest/api/3/issue/{key}",
+                get(
+                    |State(s): State<MockState>, Path(_): Path<String>, headers: HeaderMap| async move {
+                        s.headers.lock().unwrap().push(headers);
+                        Json(json!({"id":"PROJ-123","key":"PROJ-123"}))
+                    },
+                ),
+            )
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, captured)
+    }
+
+    #[tokio::test]
+    async fn mcp_missing_key_returns_401() {
+        let state = AppState {
+            start: Instant::now(),
+            config: test_config("http://localhost:0".into()),
+            jira: None,
+        };
+        let app = crate::router(state);
+        let response = app.oneshot(build_request(None, "PROJ-123")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mcp_wrong_key_returns_401() {
+        let state = AppState {
+            start: Instant::now(),
+            config: test_config("http://localhost:0".into()),
+            jira: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(Some("wrong-key"), "PROJ-123"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mcp_forbidden_project_returns_403() {
+        let (port, _headers) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port));
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(Some("agent-key"), "OTHER-123"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mcp_allows_valid_request_and_strips_client_headers() {
+        let (port, captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port));
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(Some("agent-key"), "PROJ-123"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["key"], "PROJ-123");
+
+        let upstream_headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            upstream_headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer test-token"
+        );
+        assert!(!upstream_headers.contains_key("x-atlapool-key"));
+        assert!(!upstream_headers.contains_key("cookie"));
+    }
+}

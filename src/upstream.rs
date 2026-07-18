@@ -2,7 +2,6 @@ use crate::config::AtlassianConfig;
 use reqwest::{header, Client, Method, Url};
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum UpstreamError {
     MissingConfig(&'static str),
     InvalidUrl(String),
@@ -26,14 +25,13 @@ impl std::error::Error for UpstreamError {}
 /// Upstream Jira client. Caller headers are **not** trusted; every request
 /// starts from an empty header set and receives the server-injected
 /// `Authorization` header only.
-#[allow(dead_code)]
+#[derive(Clone)]
 pub struct JiraClient {
     client: Client,
     base_url: String,
     token: crate::secrets::SecretString,
 }
 
-#[allow(dead_code)]
 impl JiraClient {
     pub fn new(config: &AtlassianConfig) -> Result<Self, UpstreamError> {
         let base_url = config
@@ -51,21 +49,38 @@ impl JiraClient {
         })
     }
 
-    /// Build a `GET /rest/api/3/myself` request for smoke-testing the proxy
-    /// chain. F2-a uses Bearer injection; the exact Atlassian auth scheme
+    /// Build a request from an empty header set, injecting only the server
+    /// bearer token. F2-a uses Bearer injection; the exact Atlassian auth scheme
     /// (Basic/OAuth) will be aligned in F2-b.
-    pub fn myself_request(&self) -> Result<reqwest::Request, UpstreamError> {
-        let url = format!("{}/rest/api/3/myself", self.base_url.trim_end_matches('/'));
+    pub fn request(&self, method: Method, path: &str) -> Result<reqwest::Request, UpstreamError> {
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let url = Url::parse(&url).map_err(|_| UpstreamError::InvalidUrl(url.clone()))?;
 
         self.client
-            .request(Method::GET, url)
+            .request(method, url)
             .header(
                 header::AUTHORIZATION,
                 format!("Bearer {}", self.token.expose_secret()),
             )
             .build()
             .map_err(UpstreamError::RequestBuild)
+    }
+
+    pub async fn send(
+        &self,
+        request: reqwest::Request,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        self.client.execute(request).await
+    }
+
+    #[allow(dead_code)]
+    pub fn myself_request(&self) -> Result<reqwest::Request, UpstreamError> {
+        self.request(Method::GET, "/rest/api/3/myself")
+    }
+
+    #[allow(dead_code)]
+    pub fn get_issue_request(&self, issue_key: &str) -> Result<reqwest::Request, UpstreamError> {
+        self.request(Method::GET, &format!("/rest/api/3/issue/{issue_key}"))
     }
 }
 
@@ -111,5 +126,16 @@ mod tests {
 
         assert_eq!(request.method(), Method::GET);
         assert_eq!(request.url().path(), "/rest/api/3/myself");
+    }
+
+    #[test]
+    fn get_issue_request_builds_correct_path() {
+        let client = JiraClient::new(&test_config()).unwrap();
+        let request = client.get_issue_request("PROJ-123").unwrap();
+
+        assert_eq!(request.method(), Method::GET);
+        assert_eq!(request.url().path(), "/rest/api/3/issue/PROJ-123");
+        let auth = request.headers().get(AUTHORIZATION).unwrap().to_str().unwrap();
+        assert_eq!(auth, "Bearer test-token");
     }
 }

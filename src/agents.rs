@@ -42,10 +42,22 @@ impl AgentConfig {
 }
 
 /// Find an agent whose configured keys contain `key`.
+///
+/// To avoid leaking key content through timing, the comparison is done by
+/// hashing both keys with SHA-256 and comparing the fixed-size digests with
+/// `subtle::ConstantTimeEq`. This prevents short-circuiting on length or on
+/// the position of first differing byte.
 pub fn find_agent<'a>(agents: &'a [AgentConfig], key: &str) -> Option<&'a AgentConfig> {
-    agents
-        .iter()
-        .find(|a| a.keys.iter().any(|k| k.expose_secret() == key))
+    use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
+
+    let key_hash = Sha256::digest(key.as_bytes());
+    agents.iter().find(|a| {
+        a.keys.iter().any(|k| {
+            let secret_hash = Sha256::digest(k.expose_secret().as_bytes());
+            key_hash.as_slice().ct_eq(secret_hash.as_slice()).unwrap_u8() == 1
+        })
+    })
 }
 
 /// Returns true if `value` matches at least one pattern in the allowlist.
