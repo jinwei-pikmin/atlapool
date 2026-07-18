@@ -57,13 +57,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 fn router(state: AppState) -> Router {
     Router::new()
-        .route("/healthz", get(healthz))
+        .route("/health", get(health))
         .route("/stats", get(stats))
         .route("/mcp", post(mcp::mcp_handler))
         .with_state(state)
 }
 
-async fn healthz() -> Json<serde_json::Value> {
+async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
 }
 
@@ -80,8 +80,8 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
-    async fn healthz_returns_ok_without_external_checks() {
-        // /healthz must stay alive even when no upstream (Jira) or audit is configured.
+    async fn health_returns_ok_without_external_checks() {
+        // /health must stay alive even when no upstream (Jira) or audit is configured.
         let app = router(AppState {
             start: Instant::now(),
             config: Config::default(),
@@ -91,7 +91,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/healthz")
+                    .uri("/health")
                     .body(Body::empty())
                     .unwrap(),
             )
