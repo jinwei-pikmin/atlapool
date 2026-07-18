@@ -1,3 +1,5 @@
+#[allow(dead_code)]
+mod agents;
 mod config;
 mod secrets;
 mod upstream;

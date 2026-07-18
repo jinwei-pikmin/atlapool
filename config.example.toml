@@ -19,7 +19,7 @@ enabled = false
 
 # [[agents]]
 # id = "demo-agent"
-# key = "env:ATLAPOOL_KEY_DEMO"
-# projects = ["PROJ-X"]
-# spaces = ["SPACE-Y"]
+# keys = ["env:ATLAPOOL_KEY_DEMO"]
+# projects = ["PROJ-X", "PROJ/*"]   # '*' matches any sequence, including path separators
+# spaces = ["SPACE-Y", "SPACE/*"]
 # tools = ["jira_search_issues", "confluence_read_page"]

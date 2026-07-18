@@ -12,6 +12,8 @@ pub struct Config {
     pub mcp: McpConfig,
     #[serde(default)]
     pub audit: AuditConfig,
+    #[serde(default)]
+    pub agents: Vec<crate::agents::AgentConfig>,
 }
 
 impl Default for Config {
@@ -21,6 +23,7 @@ impl Default for Config {
             atlassian: None,
             mcp: McpConfig::default(),
             audit: AuditConfig::default(),
+            agents: Vec::new(),
         }
     }
 }
@@ -71,6 +74,20 @@ impl Config {
                 let resolved = crate::secrets::resolve(token.expose_secret())?;
                 atlassian.token = Some(crate::secrets::SecretString::new(resolved));
             }
+        }
+        for agent in &mut config.agents {
+            agent.keys = agent
+                .keys
+                .iter()
+                .map(|k| {
+                    let s = k.expose_secret();
+                    if s.starts_with("env:") {
+                        Ok(crate::secrets::SecretString::new(crate::secrets::resolve(s)?))
+                    } else {
+                        Ok(k.clone())
+                    }
+                })
+                .collect::<Result<Vec<_>, crate::secrets::SecretError>>()?;
         }
         Ok(config)
     }
