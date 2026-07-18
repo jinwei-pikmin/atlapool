@@ -29,5 +29,5 @@ enabled = false
 # keys = ["aws:secretsmanager:prod/atlapool/agent-key"]
 # projects = ["PROJ-X", "PROJ/*"]   # '*' matches any sequence, including path separators
 # spaces = ["SPACE-Y", "SPACE/*"]
-# tools = ["jira_get_issue", "jira_search_issues", "confluence_read_page", "jira_create_issue"]
+# tools = ["jira_get_issue", "jira_search_issues", "confluence_get_page", "jira_create_issue"]
 # enable_writes = false

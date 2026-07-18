@@ -1,5 +1,6 @@
 use crate::config::AtlassianConfig;
 use reqwest::{header, Client, Method, Url};
+use serde_json::Value;
 
 #[derive(Debug)]
 pub enum UpstreamError {
@@ -88,6 +89,38 @@ impl JiraClient {
     #[allow(dead_code)]
     pub fn get_issue_request(&self, issue_key: &str) -> Result<reqwest::Request, UpstreamError> {
         self.request(Method::GET, &format!("/rest/api/3/issue/{issue_key}"), None)
+    }
+}
+
+/// Abstraction over Jira and Confluence clients so `mcp_handler` can forward
+/// requests without knowing the concrete upstream type.
+pub trait UpstreamClient: Send + Sync {
+    fn build_request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<reqwest::Request, UpstreamError>;
+
+    async fn execute(&self, request: reqwest::Request)
+        -> Result<reqwest::Response, reqwest::Error>;
+}
+
+impl UpstreamClient for JiraClient {
+    fn build_request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<reqwest::Request, UpstreamError> {
+        self.request(method, path, body)
+    }
+
+    async fn execute(
+        &self,
+        request: reqwest::Request,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        self.send(request).await
     }
 }
 
