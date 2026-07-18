@@ -57,7 +57,7 @@ fn default_port() -> u16 {
 
 impl Config {
     pub async fn load() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let backend = crate::secrets::LazyAwsBackend::new();
+        let backend = crate::secrets::LazyMultiBackend::new();
         if let Ok(path) = std::env::var("ATLAPOOL_CONFIG") {
             let content = fs::read_to_string(&path)?;
             return Self::from_toml(&backend, &content).await;
@@ -76,15 +76,18 @@ impl Config {
         let mut config: Config = toml::from_str(content)?;
         if let Some(ref mut atlassian) = config.atlassian {
             if let Some(token) = atlassian.token.as_ref() {
-                let resolved = crate::secrets::resolve(backend, token.expose_secret()).await?;
-                atlassian.token = Some(crate::secrets::SecretString::new(resolved));
+                let s = token.expose_secret();
+                if crate::secrets::is_secret_reference(s) {
+                    let resolved = crate::secrets::resolve(backend, s).await?;
+                    atlassian.token = Some(crate::secrets::SecretString::new(resolved));
+                }
             }
         }
         for agent in &mut config.agents {
             let mut resolved_keys = Vec::with_capacity(agent.keys.len());
             for k in &agent.keys {
                 let s = k.expose_secret();
-                if s.starts_with("env:") || s.starts_with("aws:secretsmanager:") {
+                if crate::secrets::is_secret_reference(s) {
                     let value = crate::secrets::resolve(backend, s).await?;
                     resolved_keys.push(crate::secrets::SecretString::new(value));
                 } else {
