@@ -1,33 +1,65 @@
 port = 8080
 
-# Secret reference formats:
-#   "env:VAR_NAME"                                    — from environment variable
-#   "aws:secretsmanager:<secret-id>"                  — from AWS Secrets Manager (plain string secret)
-#   "gcp:secretmanager:<project>/<secret>"            — from GCP Secret Manager (latest version)
-#   "gcp:secretmanager:projects/<project>/secrets/<secret>/versions/<version>" — from GCP Secret Manager
+# Secret reference formats (used for atlassian.token and agent.keys):
+#   "env:VAR_NAME"                                      - read from environment variable
+#   "aws:secretsmanager:<secret-id>"                    - AWS Secrets Manager (plain string secret)
+#   "gcp:secretmanager:<project>/<secret>"              - GCP Secret Manager latest version
+#   "gcp:secretmanager:projects/<project>/secrets/<secret>/versions/<version>"
+#                                                       - GCP Secret Manager specific version
 #
-# <secret-id> can be a secret name or a full ARN. The returned secret string
-# is used as-is; JSON sub-key extraction is not supported yet.
+# <secret-id> for AWS can be a secret name, partial ARN, or full ARN.
+# The returned secret string is used as-is; JSON sub-key extraction is not supported yet.
 
 [atlassian]
+# Base URL of your Atlassian Cloud site. Jira paths use /rest/api/3/* and
+# Confluence paths use /wiki/api/v2/* under this host.
 # base_url = "https://your-domain.atlassian.net"
-# token = "env:ATLASSIAN_TOKEN"                    # F5-a: env variable
-# token = "aws:secretsmanager:prod/atlassian/token" # F5-b: AWS Secrets Manager
-# token = "gcp:secretmanager:my-project/atlassian-token"  # F5-c: GCP Secret Manager
+
+# Server-injected token sent to Atlassian as Authorization: Bearer <token>.
+# Choose one of the secret reference examples below:
+# token = "env:ATLASSIAN_TOKEN"                       # local environment variable
+# token = "aws:secretsmanager:prod/atlassian/token"   # AWS Secrets Manager
+# token = "gcp:secretmanager:my-project/atlassian-token"  # GCP Secret Manager latest
+# token = "gcp:secretmanager:projects/my-project/secrets/atlassian-token/versions/1"
 
 [mcp]
+# Reserved fields. The server currently does not gate the /mcp endpoint on
+# `enabled` nor apply a global `enable_writes` default. The /health and /stats
+# endpoints are always available, and write-gating is controlled per-agent via
+# `agents.enable_writes` below.
 enabled = false
-# session_ttl_secs = 3600
+# enable_writes = false
 
 [audit]
-# F7: JSONL audit log for write operations. Defaults to atlapool-audit.jsonl in cwd.
+# Path to the JSONL fail-closed audit log. Write tools record an "attempt" line
+# before the upstream call; if this write fails, the request is rejected.
+# Defaults to "atlapool-audit.jsonl" in the working directory if omitted.
 # path = "/var/lib/atlapool/audit.jsonl"
 
 # [[agents]]
+# Each agent is an MCP client. It gets its own key(s), tool allowlist,
+# project/space allowlist, and write-gate flag. A missing tool/project/space
+# list is treated as empty (deny-by-default).
+#
 # id = "demo-agent"
+#
+# One or more secret references for X-Atlapool-Key headers.
 # keys = ["env:ATLAPOOL_KEY_DEMO"]
 # keys = ["aws:secretsmanager:prod/atlapool/agent-key"]
-# projects = ["PROJ-X", "PROJ/*"]   # '*' matches any sequence, including path separators
+# keys = ["gcp:secretmanager:my-project/agent-key"]
+#
+# projects: Jira project keys the agent may access. Supports glob '*'.
+#   - "PROJ-X" matches exactly PROJ-X
+#   - "PROJ/*" matches any string, including slashes
+# projects = ["PROJ-X", "PROJ/*"]
+#
+# spaces: Confluence space keys the agent may access. Supports glob '*'.
 # spaces = ["SPACE-Y", "SPACE/*"]
-# tools = ["jira_get_issue", "jira_search_issues", "confluence_get_page", "jira_create_issue"]
+#
+# tools: exact tool names this agent may call.
+# Implemented tools: jira_get_issue, jira_create_issue, confluence_get_page
+# tools = ["jira_get_issue", "jira_create_issue", "confluence_get_page"]
+#
+# enable_writes: must be true for any non-read tool (currently jira_create_issue).
+# Read tools such as jira_get_issue and confluence_get_page work when false.
 # enable_writes = false
