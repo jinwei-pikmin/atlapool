@@ -249,12 +249,17 @@ async fn forward<C: UpstreamClient>(
     })?;
 
     let upstream_status = upstream_resp.status();
-    let upstream_body = upstream_resp.json::<Value>().await.map_err(|e| {
+    let upstream_text = upstream_resp.text().await.map_err(|e| {
         (
             StatusCode::BAD_GATEWAY,
             format!("failed to read upstream: {}", e),
         )
     })?;
+    let upstream_body: Value = if upstream_text.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&upstream_text).unwrap_or_else(|_| json!(upstream_text))
+    };
 
     let (status, envelope) = if upstream_status.is_success() {
         (
@@ -2465,6 +2470,57 @@ mod tests {
         let body = bodies.lock().unwrap().pop().unwrap();
         let upstream: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(upstream["title"], "PR title");
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_create_commit_handles_204_empty_response() {
+        let app = Router::new().route(
+            "/repositories/{workspace}/{repo}/src",
+            post(|| async { StatusCode::NO_CONTENT }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let (config, audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_create_commit".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: Some(AuditLog::new(audit_path.clone())),
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_create_commit",
+                json!({
+                    "repo_slug": "my-repo",
+                    "message": "commit msg",
+                    "branch": "main",
+                    "files": { "README.md": "hello" }
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"], json!({}));
 
         std::fs::remove_file(&audit_path).ok();
     }
