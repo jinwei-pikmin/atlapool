@@ -17,7 +17,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub bitbucket_repos: Vec<String>,
     #[serde(default)]
-    pub enable_writes: bool,
+    pub enable_writes: Option<bool>,
 }
 
 /// Tool classification for write-gate decisions.
@@ -162,7 +162,7 @@ mod tests {
             spaces: vec!["SPACE".into(), "SPACE/*".into()],
             bitbucket_workspaces: vec!["WORK".into(), "WORK/*".into()],
             bitbucket_repos: vec!["REPO".into(), "REPO/*".into()],
-            enable_writes: false,
+            enable_writes: None,
         }
     }
 
@@ -234,7 +234,7 @@ mod tests {
             spaces: vec![],
             bitbucket_workspaces: vec![],
             bitbucket_repos: vec![],
-            enable_writes: false,
+            enable_writes: None,
         };
         // Project resolves and matches, even though space is unresolved.
         assert!(agent.authorize("cross_tool", Some("PROJ"), None, None, None));
@@ -250,7 +250,7 @@ mod tests {
             spaces: vec![],
             bitbucket_workspaces: vec!["WORK".into()],
             bitbucket_repos: vec!["REPO".into()],
-            enable_writes: false,
+            enable_writes: None,
         };
         assert!(agent.authorize("bitbucket_get_repo", None, None, Some("WORK"), Some("REPO")));
     }
@@ -265,7 +265,7 @@ mod tests {
             spaces: vec![],
             bitbucket_workspaces: vec!["WORK".into()],
             bitbucket_repos: vec!["REPO".into()],
-            enable_writes: false,
+            enable_writes: None,
         };
         assert!(!agent.authorize(
             "bitbucket_get_repo",

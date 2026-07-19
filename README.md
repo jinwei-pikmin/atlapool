@@ -269,8 +269,9 @@ Call `POST /mcp` with a JSON-RPC 2.0 envelope:
 
 The allowlist is deny-by-default: an agent must list the exact tool name and
 must also match the `project`, `space`, `bitbucket_workspaces`, or `bitbucket_repos`
-dimension. Read tools work when `enable_writes` is `false`. Write tools need
-`enable_writes = true` and a writable `audit.path`.
+dimension. Read tools work when writes are disabled. Write tools need `enable_writes`
+to evaluate to `true` (agent value if set, otherwise `[mcp] enable_writes`) and a
+writable `audit.path`.
 
 ### Examples
 
@@ -665,8 +666,8 @@ Notes:
 | `[bitbucket.oauth]` | `client_id` | OAuth: **Yes** | — | OAuth consumer key. Secret reference. |
 | `[bitbucket.oauth]` | `client_secret` | OAuth: **Yes** | — | OAuth consumer secret. Secret reference. |
 | `[bitbucket.oauth]` | `token_url` | No | `https://bitbucket.org/site/oauth2/access_token` | Token endpoint override. |
-| `[mcp]` | `enabled` | No | `false` | Set `true` to enable the `/mcp` endpoint. |
-| `[mcp]` | `enable_writes` | No | `false` | Default write-gate value per agent; can be overridden by `agents.enable_writes`. |
+| `[mcp]` | `enabled` | No | `false` | Set `true` to enable the `/mcp` endpoint. When `false`, `/mcp` returns `503 Service Unavailable`. |
+| `[mcp]` | `enable_writes` | No | `false` | Global default write-gate value. Used when an agent does not set `enable_writes` explicitly. |
 | `[audit]` | `path` | Writes: **Yes** | `atlapool-audit.jsonl` | Must be writable. Write tools fail when audit cannot be written. |
 | `[[agents]]` | `id` | **Yes** | — | Human-readable identifier. |
 | `[[agents]]` | `keys` | **Yes** | `[]` | One or more secrets accepted as `X-Atlapool-Key`. |
@@ -675,7 +676,7 @@ Notes:
 | `[[agents]]` | `spaces` | No | `[]` | Confluence space keys allowed. Supports glob `*`. |
 | `[[agents]]` | `bitbucket_workspaces` | No | `[]` | Bitbucket workspace slugs allowed. Supports glob `*`. |
 | `[[agents]]` | `bitbucket_repos` | No | `[]` | Bitbucket repository slugs allowed. Supports glob `*`. |
-| `[[agents]]` | `enable_writes` | No | `false` | Must be `true` for any write tool. |
+| `[[agents]]` | `enable_writes` | No | `[mcp] enable_writes` | Per-agent write-gate. When set, it overrides the global `[mcp] enable_writes`. Must be `true` (or inherited as `true`) for any write tool. |
 
 ### Service account permissions
 
@@ -790,7 +791,8 @@ Scope-to-tool mapping:
 - `spaces`: Confluence space keys allowed. Same glob semantics.
 - `bitbucket_workspaces`: Bitbucket workspace slugs allowed. Same glob semantics.
 - `bitbucket_repos`: Bitbucket repository slugs allowed. Same glob semantics.
-- `enable_writes`: must be `true` for any write tool.
+- `enable_writes`: per-agent write-gate; when set it overrides `[mcp] enable_writes`.
+  Must evaluate to `true` for any write tool.
 
 ### Read vs. write and audit
 
@@ -800,8 +802,9 @@ audit log.
 
 Write tools (`jira_create_issue`, `jira_add_comment`, `confluence_create_page`,
 `confluence_update_page`, `bitbucket_create_repo`, `bitbucket_create_branch`,
-`bitbucket_create_commit`, `bitbucket_create_pull_request`) require
-`enable_writes = true` and a configured `audit.path`.
+`bitbucket_create_commit`, `bitbucket_create_pull_request`) require a configured
+`audit.path` and `enable_writes` to be `true` for the agent (per-agent value if
+set, otherwise `[mcp] enable_writes`).
 
 Audit guarantee:
 
@@ -873,7 +876,7 @@ Run it in one terminal, set `base_url = "http://127.0.0.1:9001"` in
 | `missing or empty X-Atlapool-Key` | Request lacks the `X-Atlapool-Key` header. | Add `-H "X-Atlapool-Key: your-key"`. |
 | `unknown key` | The key is not in any `agents.keys` list. | Check `config.toml` keys and secret resolution. |
 | `not permitted by agent policy` | Tool, project, space, or Bitbucket workspace/repo is not allowed. | Verify `tools`, `projects`, `spaces`, `bitbucket_workspaces`, and `bitbucket_repos` arrays for the agent. |
-| `write tools not enabled for agent` | Calling a write tool without `enable_writes = true`. | Set `enable_writes = true` for that agent. |
+| `write tools not enabled for agent` | Calling a write tool without `enable_writes = true` for the agent or `[mcp] enable_writes`. | Set `enable_writes = true` on the agent, or set `[mcp] enable_writes = true` as the global default. |
 | `audit log not configured` / `audit log write failed` | The audit log path is missing or unwritable. | Set `audit.path` or ensure the directory exists. |
 | `upstream not configured` / `confluence upstream not configured` / `bitbucket upstream not configured` | The corresponding upstream section is missing or required fields are empty. | Fill in `token` and `cloud_id` / `base_url` (or `workspace` for Bitbucket). |
 | `unsupported tool` | The tool name is not implemented or not in the agent `tools` list. | Use a supported tool name. |
