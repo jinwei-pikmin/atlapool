@@ -341,6 +341,51 @@ fn resolve_target(tool: &str, args: Option<&Value>) -> Result<ToolTarget, String
                 body: None,
             })
         }
+        "confluence_create_page" => {
+            let args = args.ok_or("missing arguments")?;
+            let space = args
+                .get("space")
+                .and_then(|v| v.as_str())
+                .ok_or("missing space")?
+                .to_string();
+            if space.is_empty() {
+                return Err("space must not be empty".into());
+            }
+            let space_id = args
+                .get("space_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing space_id")?;
+            if space_id.is_empty() || !space_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err("space_id must be a non-empty numeric id".into());
+            }
+            let title = args
+                .get("title")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or("missing title")?;
+            let body = args
+                .get("body")
+                .filter(|v| !v.is_null())
+                .cloned()
+                .ok_or("missing body")?;
+            let body_value = if let Some(s) = body.as_str() {
+                json!({ "representation": "storage", "value": s })
+            } else {
+                body
+            };
+            Ok(ToolTarget {
+                project: None,
+                space: Some(space),
+                method: Method::POST,
+                path: "/wiki/api/v2/pages".into(),
+                body: Some(json!({
+                    "spaceId": space_id,
+                    "status": "current",
+                    "title": title,
+                    "body": body_value
+                })),
+            })
+        }
         "confluence_update_page" => {
             let args = args.ok_or("missing arguments")?;
             let space = args
@@ -487,6 +532,7 @@ mod tests {
                 keys: vec![SecretString::new("agent-key")],
                 tools: vec![
                     "confluence_get_page".into(),
+                    "confluence_create_page".into(),
                     "confluence_update_page".into(),
                 ],
                 projects: vec![],
@@ -596,6 +642,18 @@ mod tests {
                 }))
             };
 
+        let create_handler = |State(s): State<MockState>, headers: HeaderMap, body: Bytes| async move {
+            s.headers.lock().unwrap().push(headers);
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_default();
+            let title = payload["title"].as_str().unwrap_or("Untitled");
+            Json(json!({
+                "id": "67890",
+                "title": title,
+                "spaceId": payload["spaceId"],
+                "body": { "storage": payload["body"] }
+            }))
+        };
+
         let update_handler = |State(s): State<MockState>,
                               Path(id): Path<String>,
                               headers: HeaderMap,
@@ -618,6 +676,7 @@ mod tests {
                 "/wiki/api/v2/pages/{id}",
                 get(get_handler).put(update_handler),
             )
+            .route("/wiki/api/v2/pages", post(create_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1163,6 +1222,171 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_create_page_allowed_and_strips_headers() {
+        let (port, captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            Some(temp_audit_path()),
+            vec!["SPACE".into()],
+        );
+        let audit_path = config.audit.path.clone().unwrap();
+        let audit = Some(AuditLog::new(audit_path.clone()));
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            audit,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_create_page",
+                json!({
+                    "space": "SPACE",
+                    "space_id": "12345",
+                    "title": "New Page",
+                    "body": "<p>Hello</p>"
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["id"], "67890");
+        assert_eq!(json["result"]["title"], "New Page");
+
+        let upstream_headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            upstream_headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer test-token"
+        );
+        assert!(!upstream_headers.contains_key("x-atlapool-key"));
+        assert!(!upstream_headers.contains_key("cookie"));
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        let line = log.trim();
+        assert!(line.contains("\"agent_id\":\"demo\""));
+        assert!(line.contains("\"tool\":\"confluence_create_page\""));
+        assert!(line.contains("\"target\":\"SPACE\""));
+        assert!(line.contains("\"result\":\"attempt\""));
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_create_page_forbidden_space_returns_403() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_create_page",
+                json!({
+                    "space": "OTHER",
+                    "space_id": "12345",
+                    "title": "New Page",
+                    "body": "<p>Hello</p>"
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_create_page_write_disabled_returns_403() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_create_page",
+                json!({
+                    "space": "SPACE",
+                    "space_id": "12345",
+                    "title": "New Page",
+                    "body": "<p>Hello</p>"
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_create_page_rejects_missing_title() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_create_page",
+                json!({
+                    "space": "SPACE",
+                    "space_id": "12345",
+                    "body": "<p>Hello</p>"
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
