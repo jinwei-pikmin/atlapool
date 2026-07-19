@@ -2,7 +2,7 @@
 
 ## 狀態
 
-Proposed — 待凱撒複核
+Accepted — 凱撒複核通過，已實作
 
 ## 背景
 
@@ -58,42 +58,61 @@ oauth.client_secret = "env:BITBUCKET_CLIENT_SECRET"  # OAuth consumer secret
 - `client_id` 與 `client_secret` 使用既有的 secret reference 格式（`env:`、`aws:`、`gcp:`）。
 - 若 `oauth` 存在且 `client_id`/`client_secret` 皆提供，則走 OAuth；否則仍用 `token`。
 
+### 新增/修改檔案
+
+- `src/bitbucket_token.rs`：新的 `BitbucketTokenCache`，處理 OAuth token 取得、快取、過期與 refresh。
+- `src/bitbucket.rs`：`BitbucketClient` 改為 `TokenProvider` enum（`Static` / `OAuth`），`request` 改為 async 以等待 token。
+- `src/config.rs`：新增 `BitbucketOAuthConfig` 與解析邏輯。
+- `src/upstream.rs`：`UpstreamClient::build_request` 改為 async；新增 `TokenFetch` 錯誤變體。
+- `src/confluence.rs`：配合 `UpstreamClient` async 調整。
+- `src/mcp.rs`：`forward` 改為 `.await` build_request。
+- `src/main.rs`：註冊 `bitbucket_token` 模組。
+- `README.md` 與 `config.example.toml`：補上 OAuth 設定與 limitation 說明。
+
 ### Token 管理元件
 
-- 新增 `src/bitbucket_token.rs`（或併入 `src/bitbucket.rs`）的 `BitbucketTokenCache`：
-  - 持有 `client_id`、`client_secret`、`token_url`。
+- `src/bitbucket_token.rs` 的 `BitbucketTokenCache`：
+  - 持有 `client_id`、`client_secret`、`token_url`、獨立的 `reqwest::Client`。
   - 快取 `access_token`、`expires_at`（UTC）、`refresh_token`。
-  - 提供 `async fn get_token() -> Result<String, UpstreamError>`。
+  - 提供 `pub async fn get_token() -> Result<String, UpstreamError>`。
 
 ### 快取與並發策略
 
-- 使用 `tokio::sync::Mutex<TokenCache>` 保護快取狀態。
-- 每次請求前鎖住，檢查 token 是否在有效期內（使用 10 分鐘 grace period）。
-- 若過期或尚未取得：
-  - 先嘗試 `grant_type=refresh_token`（若有 refresh token）。
-  - 否則走 `grant_type=client_credentials`。
+- 使用 `tokio::sync::Mutex<TokenState>` 保護快取。
+- 每次 `get_token()` 鎖住狀態：
+  - 若 access token 存在且尚未過期，直接回傳複本。
+  - 若過期或無 token，先嘗試 `grant_type=refresh_token`（若有 refresh token），失敗則 fallback 到 `grant_type=client_credentials`。
   - 更新快取後釋放鎖。
-- 此策略確保**同一時間只會有一個 refresh 請求**發往 Bitbucket，簡單且可預測。未來若成為瓶頸，可再改為 read/write lock 或 in-flight future 去重。
+- 此策略確保**同一時間只會有一個 token 請求**發往 Bitbucket，簡單且可預測。未來若成為瓶頸，可再改為 read/write lock 或 in-flight future 去重。
 
 ### 整合到 `BitbucketClient`
 
-- `BitbucketClient` 改為內部持有 `Arc<BitbucketTokenCache>`（OAuth）或 `Option<SecretString>`（靜態 token）。
-- `BitbucketClient::auth_header()` 根據設定回傳 `Authorization: Bearer <token>`：
-  - OAuth 模式：呼叫 `token_cache.get_token().await`。
+- `BitbucketClient` 內部改為 `TokenProvider` enum：
+  - `Static(SecretString)`：直接 expose 既有 `[bitbucket].token`。
+  - `OAuth(Arc<BitbucketTokenCache>)`：使用 OAuth 快取。
+- `BitbucketClient::auth_token()` async：
+  - OAuth 模式：呼叫 `cache.get_token().await`。
   - 靜態模式：直接回傳 `bitbucket.token`。
+- `BitbucketClient::request` 改為 async，等待 `auth_token()` 後注入 `Authorization: Bearer <token>`。
 
 ### TTL 與過期處理
 
-- 回應中的 `expires_in` 為秒；計算 `expires_at = now + expires_in - 600`（保留 10 分鐘緩衝）。
-- 若 Bitbucket 回應沒有 `expires_in`，保守預設 7200 秒。
+- 回應中的 `expires_in` 為秒；若缺失，保守預設 7200 秒。
+- 計算有效期限時使用 grace period：`expires_in / 10`，上限 600 秒、下限 1 秒；對於 2 小時 token 約等於提前 12 分鐘 refresh，對於極短測試 token 仍至少保留 1 秒。
 - 即使 token 在 grace 區間外過期，請求會收到 401；此時快取會標記為過期並於下一次請求時 refresh。
 
 ### 測試策略
 
-- 單元測試使用 mock OAuth server（`tokio` TCP listener）回傳固定 access token 與 `expires_in`。
-- 並發測試：spawn 多個 `get_token()` 任務，驗證 mock 只收到一次 token 請求。
-- 過期測試：回傳 `expires_in=2`，等待 3 秒後再次請求，驗證觸發第二次 token 請求。
-- 錯誤測試：client credentials 錯誤回傳 401，驗證 `UpstreamError::Authentication`。
+- `src/bitbucket_token.rs` 單元測試：
+  - 首次取得並快取，mock 只收到一次請求。
+  - 過期後 refresh（`expires_in=2`，等待 3 秒）。
+  - 10 個並發 `get_token()` 僅觸發一次 mock token 請求。
+  - token endpoint 回傳 401 時 `get_token()` 回傳 `UpstreamError::TokenFetch`。
+- `src/bitbucket.rs` 單元測試：
+  - 靜態 token 注入正確。
+  - OAuth 設定下，第一次 `get_repo_request()` 會觸發 token fetch 並注入 `Bearer oauth-access-1`。
+  - 第二次請求使用快取，token server 請求次數仍為 1。
+- 受 `UpstreamClient::build_request` async 影響，`src/mcp.rs`、`src/upstream.rs`、`src/confluence.rs` 相關測試同步調整為 `#[tokio::test]`。
 
 ## 後果
 

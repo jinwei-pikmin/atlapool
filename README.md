@@ -23,11 +23,12 @@ injects the real token upstream, and audit-logs every write operation.
 - **Bearer token injection** — atlapool forwards upstream requests with
   `Authorization: Bearer <token>` after stripping caller-supplied sensitive
   headers.
-- **Current limitation** — atlapool currently forwards the **same long-lived
-  Service Account token** to every upstream request. It does **not** mint
-  per-repo or per-session short-lived tokens like ghpool's GitHub App
-  installation tokens. This is a known architectural limitation; short-lived
-  credential minting is planned for a future release.
+- **Current limitation** — Jira and Confluence still forward the configured
+  long-lived token. Bitbucket can now use OAuth 2.0 client credentials to
+  obtain 2-hour access tokens with automatic refresh, but these tokens are
+  workspace/consumer scoped; atlapool does **not** yet mint per-repo
+  short-lived tokens like ghpool's GitHub App installation tokens. Repo-level
+  isolation for Bitbucket is still enforced by the `bitbucket_repos` allowlist.
 
 ## Architecture
 
@@ -68,8 +69,9 @@ Request flow for `POST /mcp`:
 2. Resolve `tool`, `project`, `space`, `workspace`, and `repo` allowlists.
 3. For write tools: verify `enable_writes = true` and write a fail-closed
    `attempt` audit record.
-4. Build the upstream request from an empty header set, inject the configured
-   `Authorization: Bearer <token>`, and forward it.
+4. Build the upstream request from an empty header set, inject the current
+   bearer token (static for Jira/Confluence; fetched or cached for Bitbucket),
+   and forward it.
 5. Return the upstream response to the caller.
 
 ## Status
@@ -77,7 +79,7 @@ Request flow for `POST /mcp`:
 | Milestone | Status | Highlights |
 |---|---|---|
 | **v0.1** | ✅ Complete | 12 MCP tools for Jira, Confluence, and Bitbucket (read + write); write-gate; fail-closed pre-flight `attempt` audit logging + post-flight `result` records; per-agent allowlists; `env` / AWS / GCP secret resolution; `/health` and `/stats` endpoints. |
-| **v0.2** | 📋 Planned | Per-tool / per-repo short-lived token minting; additional read tools such as `jira_search_issues`. |
+| **v0.2** | 📋 Planned | Bitbucket OAuth client credentials with cached, auto-refreshed short-lived tokens; additional read tools such as `jira_search_issues`. |
 
 ## How clients use it
 
@@ -542,6 +544,10 @@ token = "env:ATLASSIAN_TOKEN"
 [bitbucket]
 workspace = "my-workspace"
 token = "env:BITBUCKET_TOKEN"
+# Or use short-lived OAuth tokens:
+# [bitbucket.oauth]
+# client_id = "env:BITBUCKET_CLIENT_ID"
+# client_secret = "env:BITBUCKET_CLIENT_SECRET"
 
 [[agents]]
 id = "demo"
@@ -578,7 +584,8 @@ Notes:
 
 ### Secret reference formats
 
-`atlassian.token`, `bitbucket.token` and each `keys` entry can be any of:
+`atlassian.token`, `bitbucket.token`, `bitbucket.oauth.client_id`,
+`bitbucket.oauth.client_secret`, and each `keys` entry can be any of:
 
 - `env:VAR_NAME` — local environment variable.
 - `aws:secretsmanager:<secret-id>` — AWS Secrets Manager plain-string secret.
@@ -596,7 +603,10 @@ Notes:
 | `[atlassian]` | `token` | Atlassian tools: **Yes** | — | Atlassian API token, in any secret-ref format above. |
 | `[bitbucket]` | `workspace` | Bitbucket tools: **Yes** | — | Workspace slug; server injects it into every Bitbucket path. |
 | `[bitbucket]` | `base_url` | No | `https://api.bitbucket.org/2.0` | Only override for private Bitbucket Server. |
-| `[bitbucket]` | `token` | Bitbucket tools: **Yes** | — | Bitbucket app password / OAuth token. |
+| `[bitbucket]` | `token` | Bitbucket tools: **One of token/oauth** | — | Long-lived app password / access token. |
+| `[bitbucket.oauth]` | `client_id` | OAuth: **Yes** | — | OAuth consumer key. Secret reference. |
+| `[bitbucket.oauth]` | `client_secret` | OAuth: **Yes** | — | OAuth consumer secret. Secret reference. |
+| `[bitbucket.oauth]` | `token_url` | No | `https://bitbucket.org/site/oauth2/access_token` | Token endpoint override. |
 | `[mcp]` | `enabled` | No | `false` | Set `true` to enable the `/mcp` endpoint. |
 | `[mcp]` | `enable_writes` | No | `false` | Default write-gate value per agent; can be overridden by `agents.enable_writes`. |
 | `[audit]` | `path` | Writes: **Yes** | `atlapool-audit.jsonl` | Must be writable. Write tools fail when audit cannot be written. |
@@ -611,8 +621,10 @@ Notes:
 
 ### Service account permissions
 
-atlapool sends the configured token as `Authorization: Bearer <token>`. You do
-**not** need `email` or Basic Auth; atlapool has never used the `email` field.
+atlapool sends the configured token as `Authorization: Bearer <token>`. For
+Bitbucket, it can instead fetch short-lived OAuth access tokens from
+`[bitbucket.oauth]` and cache them until expiry. You do **not** need `email` or
+Basic Auth; atlapool has never used the `email` field.
 
 #### Atlassian Cloud
 
@@ -653,8 +665,12 @@ REST calls are sent through the `api.atlassian.com` gateway using `cloud_id`:
 
 #### Bitbucket Cloud
 
-Create an **App password** or **OAuth consumer** for the workspace and grant at
-least:
+Choose one of the following authentication methods:
+
+- **App password / long-lived access token**: configure `[bitbucket].token`.
+- **OAuth 2.0 client credentials**: configure `[bitbucket.oauth]` with a
+  consumer `client_id` and `client_secret`. atlapool will fetch a 2-hour access
+  token and refresh it before expiry. The consumer must be granted at least:
 
 - `repository:read` — for `bitbucket_get_repo`
 - `pullrequest:read` — for `bitbucket_get_pull_request`
@@ -673,7 +689,9 @@ if overridden):
 
 ### Bitbucket scopes
 
-Create an **App password** or **OAuth consumer** with the scopes below:
+Create an **App password** or **OAuth consumer** with the scopes below. For OAuth,
+grant these scopes on the consumer; atlapool cannot request narrower scopes at
+runtime.
 
 ```
 repository:admin
