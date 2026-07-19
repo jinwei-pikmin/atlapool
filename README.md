@@ -427,6 +427,55 @@ The workspace for Bitbucket calls comes from `[bitbucket].workspace` in
 
 See [`config.example.toml`](config.example.toml) for a fully annotated file.
 
+### Minimal working config
+
+This is the smallest setup used in real testing. It enables one agent to call
+Jira, Confluence, and Bitbucket tools:
+
+```toml
+port = 8080
+
+[atlassian]
+cloud_id = "env:ATLASSIAN_CLOUD_ID"
+token = "env:ATLASSIAN_TOKEN"
+
+[bitbucket]
+workspace = "my-workspace"
+token = "env:BITBUCKET_TOKEN"
+
+[[agents]]
+id = "demo"
+keys = ["env:ATLAPOOL_KEY_DEMO"]
+tools = [
+  "jira_get_issue",
+  "jira_create_issue",
+  "jira_add_comment",
+  "confluence_get_page",
+  "confluence_create_page",
+  "confluence_update_page",
+  "bitbucket_get_repo",
+  "bitbucket_get_pull_request",
+  "bitbucket_create_repo",
+  "bitbucket_create_branch",
+  "bitbucket_create_commit",
+  "bitbucket_create_pull_request",
+]
+projects = ["PROJ"]
+spaces = ["SPACE"]
+bitbucket_workspaces = ["my-workspace"]
+bitbucket_repos = ["my-repo"]
+enable_writes = true
+```
+
+Notes:
+
+- `base_url` is **not** required for Atlassian or Bitbucket; the defaults are the
+  public cloud endpoints.
+- `atlassian.cloud_id` takes precedence over `atlassian.base_url` when both are
+  set.
+- `bitbucket.workspace` is required for all Bitbucket tools and is injected by
+  the server; the caller cannot override it.
+
 ### Secret reference formats
 
 `atlassian.token`, `bitbucket.token` and each `keys` entry can be any of:
@@ -437,21 +486,28 @@ See [`config.example.toml`](config.example.toml) for a fully annotated file.
 - `gcp:secretmanager:projects/<project>/secrets/<secret>/versions/<version>` —
   GCP Secret Manager specific version.
 
-Examples:
+### Field reference
 
-```toml
-[atlassian]
-# cloud_id = "12345678-1234-1234-1234-123456789abc"
-# base_url = "https://your-domain.atlassian.net"
-# token = "env:ATLASSIAN_TOKEN"
-# token = "aws:secretsmanager:prod/atlassian/token"
-# token = "gcp:secretmanager:my-project/atlassian-token"
-
-[bitbucket]
-# workspace = "my-workspace"
-# base_url = "https://api.bitbucket.org/2.0"
-# token = "env:BITBUCKET_TOKEN"
-```
+| Section | Field | Required | Default | Notes |
+|---|---|---|---|---|
+| top-level | `port` | No | `8080` | HTTP listen port. |
+| `[atlassian]` | `cloud_id` | Atlassian tools: **Yes** | — | Cloud ID from `https://<domain>.atlassian.net/_edge/tenant_info`. |
+| `[atlassian]` | `base_url` | No | — | Fallback when `cloud_id` is not set; computed as `https://api.atlassian.com/ex/jira/{cloud_id}` when `cloud_id` is present. Only needed for private installs. |
+| `[atlassian]` | `token` | Atlassian tools: **Yes** | — | Atlassian API token, in any secret-ref format above. |
+| `[bitbucket]` | `workspace` | Bitbucket tools: **Yes** | — | Workspace slug; server injects it into every Bitbucket path. |
+| `[bitbucket]` | `base_url` | No | `https://api.bitbucket.org/2.0` | Only override for private Bitbucket Server. |
+| `[bitbucket]` | `token` | Bitbucket tools: **Yes** | — | Bitbucket app password / OAuth token. |
+| `[mcp]` | `enabled` | No | `false` | Set `true` to enable the `/mcp` endpoint. |
+| `[mcp]` | `enable_writes` | No | `false` | Default write-gate value per agent; can be overridden by `agents.enable_writes`. |
+| `[audit]` | `path` | Writes: **Yes** | `atlapool-audit.jsonl` | Must be writable. Write tools fail when audit cannot be written. |
+| `[[agents]]` | `id` | **Yes** | — | Human-readable identifier. |
+| `[[agents]]` | `keys` | **Yes** | `[]` | One or more secrets accepted as `X-Atlapool-Key`. |
+| `[[agents]]` | `tools` | **Yes** | `[]` | Exact MCP tool names this agent may call. |
+| `[[agents]]` | `projects` | No | `[]` | Jira project keys allowed. Supports glob `*`. |
+| `[[agents]]` | `spaces` | No | `[]` | Confluence space keys allowed. Supports glob `*`. |
+| `[[agents]]` | `bitbucket_workspaces` | No | `[]` | Bitbucket workspace slugs allowed. Supports glob `*`. |
+| `[[agents]]` | `bitbucket_repos` | No | `[]` | Bitbucket repository slugs allowed. Supports glob `*`. |
+| `[[agents]]` | `enable_writes` | No | `false` | Must be `true` for any write tool. |
 
 ### Service account permissions
 
@@ -514,6 +570,26 @@ if overridden):
 - Branches: `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/refs/branches`
 - Source (commit): `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/src`
 - Pull requests: `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/pullrequests`
+
+### Bitbucket scopes
+
+Create an **App password** or **OAuth consumer** with the scopes below:
+
+```
+repository:admin
+repository:read
+repository:write
+pullrequest:read
+pullrequest:write
+```
+
+Scope-to-tool mapping:
+
+- `repository:admin` — `bitbucket_create_repo` (Bitbucket requires admin scope for repository creation)
+- `repository:read` — `bitbucket_get_repo`
+- `repository:write` — `bitbucket_create_branch`, `bitbucket_create_commit`
+- `pullrequest:read` — `bitbucket_get_pull_request`
+- `pullrequest:write` — `bitbucket_create_pull_request`
 
 ### Agent allowlists
 

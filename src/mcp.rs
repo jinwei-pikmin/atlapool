@@ -310,6 +310,22 @@ fn resolve_target(
         }
         Ok(())
     };
+    let valid_issue_key = |s: &str| -> Result<(), String> {
+        let Some((project, number)) = s.split_once('-') else {
+            return Err("issue_key must be in PROJECT-NUMBER format".into());
+        };
+        if project.is_empty()
+            || !project
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err("issue_key project part contains invalid characters".into());
+        }
+        if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+            return Err("issue_key number part must be numeric".into());
+        }
+        Ok(())
+    };
 
     match tool {
         "jira_get_issue" => {
@@ -318,6 +334,7 @@ fn resolve_target(
                 .get("issue_key")
                 .and_then(|v| v.as_str())
                 .ok_or("missing issue_key")?;
+            valid_issue_key(issue_key)?;
             let project = issue_key.split_once('-').map(|(p, _)| p.to_string());
             Ok(ToolTarget {
                 workspace: None,
@@ -352,6 +369,7 @@ fn resolve_target(
                 .get("issue_key")
                 .and_then(|v| v.as_str())
                 .ok_or("missing issue_key")?;
+            valid_issue_key(issue_key)?;
             let project = issue_key.split_once('-').map(|(p, _)| p.to_string());
             let body = args.get("body").cloned().ok_or("missing body")?;
             Ok(ToolTarget {
@@ -1324,6 +1342,61 @@ mod tests {
             ))
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_get_issue_rejects_path_traversal_in_issue_key() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_get_issue",
+                json!({"issue_key": "PROJ-1/../../user/search"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_add_comment_rejects_invalid_issue_key() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), true, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_add_comment",
+                json!({
+                    "issue_key": "PROJ-not-a-number",
+                    "body": { "type": "doc", "version": 1, "content": [] }
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
