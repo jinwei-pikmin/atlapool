@@ -20,9 +20,13 @@ v1 已提供 Jira 讀取（`jira_get_issue`）、Jira 建立 issue（`jira_creat
    - allowlist 維度：`projects`（由 `issue_key` split `-` 取 project）。
    - `classify_tool` 因名稱不含 `get/list/search/read` 視為 Write，觸發 write-gate 與 audit。
 4. `confluence_create_page` / `confluence_update_page`：
-   - 走 `api.atlassian.com/ex/confluence/{cloud_id}/wiki/rest/api/content`。
-   - allowlist 維度：`spaces`（`space_key`），**page-level 細粒度不做**（至尊裁定 space 層已足夠）。
-   - `confluence_update_page` 需要呼叫方提供 `version`（Confluence 樂觀鎖）。
+   - 走 `api.atlassian.com/ex/confluence/{cloud_id}/wiki/api/v2/pages`。
+   - 必填參數：
+     - `space`：space key，用於 allowlist（`agent.spaces`）
+     - `space_id`：數字 space ID，直接寫入 V2 API body
+     - `title`、`body`（storage HTML 字串，原樣透傳後包成 `{"representation":"storage","value":...}`；也可傳完整 object）
+     - `confluence_update_page` 額外需要 `page_id`（數字）與 `version`（樂觀鎖，正整數）
+   - allowlist 維度：`spaces`（以 `space` 比對），**page-level 細粒度不做**（至尊裁定 space 層已足夠）。
    - 409 conflict 直接透傳，不特殊處理。
 5. 文件同步：README MCP 工具清單、config.example.toml 註解、測試逐步更新。
 

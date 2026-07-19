@@ -155,12 +155,14 @@ Call `POST /mcp` with a JSON-RPC 2.0 envelope:
 | `jira_get_issue` | Fetch a Jira issue by key | `issue_key` (e.g. `PROJ-123`) | `projects` (parsed from key) | No | No |
 | `jira_create_issue` | Create a Jira issue | `project`, `summary`, plus any Jira `fields` | `projects` (from `project`) | Yes (`enable_writes = true`) | Yes |
 | `jira_add_comment` | Add a comment to a Jira issue | `issue_key`, `body` (ADF, forwarded as-is) | `projects` (parsed from key) | Yes | Yes |
-| `confluence_get_page` | Fetch a Confluence page by ID | `page_id` (numeric page ID), `space` | `spaces` | No | No |
+| `confluence_get_page` | Fetch a Confluence page by ID | `page_id` (numeric page ID), `space` (key for allowlist) | `spaces` | No | No |
+| `confluence_create_page` | Create a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `title`, `body` (storage HTML) | `spaces` | Yes | Yes |
+| `confluence_update_page` | Update a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `page_id` (numeric ID), `title`, `version`, `body` (storage HTML) | `spaces` | Yes | Yes |
 
 The allowlist is deny-by-default: an agent must list the exact tool name and
 must also match the `project` or `space` dimension. Read tools (`jira_get_issue`,
 `confluence_get_page`) work when `enable_writes` is `false`. Write tools
-(`jira_create_issue`, `jira_add_comment`) need `enable_writes = true` and a
+(`jira_create_issue`, `jira_add_comment`, `confluence_create_page`, `confluence_update_page`) need `enable_writes = true` and a
 writable `audit.path`.
 
 ### Examples
@@ -244,6 +246,56 @@ curl -s -X POST http://localhost:8080/mcp \
   }'
 ```
 
+**Create a Confluence page**
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "confluence_create_page",
+      "arguments": {
+        "space": "SPACE",
+        "space_id": "12345",
+        "title": "New page",
+        "body": "<p>Hello</p>"
+      }
+    }
+  }'
+```
+
+**Update a Confluence page**
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "confluence_update_page",
+      "arguments": {
+        "space": "SPACE",
+        "space_id": "12345",
+        "page_id": "67890",
+        "title": "Updated page",
+        "version": 2,
+        "body": "<p>Updated</p>"
+      }
+    }
+  }'
+```
+
+For `confluence_create_page` and `confluence_update_page`, the `body` argument
+can also be a full JSON object with `representation` and `value` if the caller
+wants full control over the body format.
+
 ## Configuration
 
 See [`config.example.toml`](config.example.toml) for a fully annotated file.
@@ -311,15 +363,15 @@ gateway using `cloud_id`:
 - `projects`: Jira project keys allowed. Supports glob `*` (matches any sequence,
   including `/`).
 - `spaces`: Confluence space keys allowed. Same glob semantics.
-- `enable_writes`: must be `true` for any write tool, currently only
-  `jira_create_issue`.
+- `enable_writes`: must be `true` for any write tool (`jira_create_issue`,
+  `jira_add_comment`, `confluence_create_page`, `confluence_update_page`).
 
 ### Read vs. write and audit
 
 `jira_get_issue` and `confluence_get_page` are read tools. They pass through the
 allowlist and do not touch the audit log.
 
-`jira_create_issue` is a write tool. It requires `enable_writes = true` and a
+`jira_create_issue`, `jira_add_comment`, `confluence_create_page`, and `confluence_update_page` are write tools. They require `enable_writes = true` and a
 configured `audit.path`. If audit logging fails, the request is rejected before
 the upstream call.
 
@@ -362,7 +414,7 @@ Run it in one terminal, set `base_url = "http://127.0.0.1:9001"` in
 | `write tools not enabled for agent` | Calling a write tool without `enable_writes = true`. | Set `enable_writes = true` for that agent. |
 | `audit log not configured` / `audit log write failed` | The audit log path is missing or unwritable. | Set `audit.path` or ensure the directory exists. |
 | `upstream not configured` / `confluence upstream not configured` | `[atlassian]` section is missing or `base_url`/`token` are empty. | Fill in `token` and `cloud_id` (or `base_url` as fallback). |
-| `unsupported tool` | The tool name is not implemented or not in the agent `tools` list. | Use `jira_get_issue`, `jira_create_issue`, `jira_add_comment`, or `confluence_get_page`. |
+| `unsupported tool` | The tool name is not implemented or not in the agent `tools` list. | Use `jira_get_issue`, `jira_create_issue`, `jira_add_comment`, `confluence_get_page`, `confluence_create_page`, or `confluence_update_page`. |
 | Jira returns 401 or 403 | The Atlassian token is invalid or lacks permissions. | Regenerate `ATLASSIAN_TOKEN` and check project access. |
 
 ## License
