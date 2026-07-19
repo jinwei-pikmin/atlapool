@@ -238,10 +238,43 @@ Examples:
 ```toml
 [atlassian]
 # base_url = "https://your-domain.atlassian.net"
+# email = "agent@example.com"
+# cloud_id = "12345678-1234-1234-1234-123456789abc"
 # token = "env:ATLASSIAN_TOKEN"
 # token = "aws:secretsmanager:prod/atlassian/token"
 # token = "gcp:secretmanager:my-project/atlassian-token"
 ```
+
+### Atlassian credentials
+
+You need three values from your Atlassian Cloud site:
+
+1. **Email** — the Atlassian account email used for Basic Auth.
+2. **API token** — create one at
+   [https://id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens).
+3. **Cloud ID** — the unique identifier of your Atlassian Cloud site. To find
+   it, sign in to your site and open:
+
+   ```
+   https://<your-domain>.atlassian.net/_edge/tenant_info
+   ```
+
+   The response is a JSON object; copy the value of the `cloudId` field. For
+   example, if your site domain is `example`, the URL is:
+
+   ```
+   https://example.atlassian.net/_edge/tenant_info
+   ```
+
+   and `cloudId` looks like `12345678-1234-1234-1234-123456789abc`.
+
+The `base_url` field (`https://<your-domain>.atlassian.net`) is kept for
+human-readable links and for looking up the cloud ID. After Issue #25, the
+actual REST calls are sent through the `api.atlassian.com` gateway using
+`cloud_id`:
+
+- Jira: `https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/...`
+- Confluence: `https://api.atlassian.com/ex/confluence/{cloud_id}/wiki/rest/api/...`
 
 ### Agent allowlists
 
