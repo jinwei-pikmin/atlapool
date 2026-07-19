@@ -31,14 +31,15 @@ cd atlapool
 cp config.example.toml config.toml
 ```
 
-2. Edit `config.toml`. The smallest working setup is one agent with an
-   environment-backed token.
+2. Edit `config.toml`. The smallest working setup is one agent with
+   environment-backed credentials.
 
 ```toml
 port = 8080
 
 [atlassian]
-base_url = "https://your-domain.atlassian.net"
+email = "env:ATLASSIAN_EMAIL"
+cloud_id = "env:ATLASSIAN_CLOUD_ID"
 token = "env:ATLASSIAN_TOKEN"
 
 [mcp]
@@ -55,6 +56,8 @@ enable_writes = false
 Then export the secrets:
 
 ```sh
+export ATLASSIAN_EMAIL="agent@example.com"
+export ATLASSIAN_CLOUD_ID="your-cloud-id"
 export ATLASSIAN_TOKEN="your-atlassian-api-token"
 export ATLAPOOL_KEY_DEMO="demo-secret-key"
 ```
@@ -66,6 +69,8 @@ docker build -t atlapool .
 docker run -d --name atlapool \
   -p 8080:8080 \
   -e PORT=8080 \
+  -e ATLASSIAN_EMAIL \
+  -e ATLASSIAN_CLOUD_ID \
   -e ATLASSIAN_TOKEN \
   -e ATLAPOOL_KEY_DEMO \
   atlapool
@@ -124,6 +129,8 @@ If you already have a Rust toolchain:
 ```sh
 cp config.example.toml config.toml
 # edit config.toml as above
+export ATLASSIAN_EMAIL="agent@example.com"
+export ATLASSIAN_CLOUD_ID="your-cloud-id"
 export ATLASSIAN_TOKEN="your-atlassian-api-token"
 export ATLAPOOL_KEY_DEMO="demo-secret-key"
 cargo run
@@ -237,6 +244,8 @@ Examples:
 
 ```toml
 [atlassian]
+# email = "env:ATLASSIAN_EMAIL"
+# cloud_id = "env:ATLASSIAN_CLOUD_ID"
 # base_url = "https://your-domain.atlassian.net"
 # email = "agent@example.com"
 # cloud_id = "12345678-1234-1234-1234-123456789abc"
@@ -332,7 +341,7 @@ Run it in one terminal, set `base_url = "http://127.0.0.1:9001"` in
 | `not permitted by agent policy` | Tool, project, or space is not allowed. | Verify `tools`, `projects`, and `spaces` arrays for the agent. |
 | `write tools not enabled for agent` | Calling `jira_create_issue` without `enable_writes = true`. | Set `enable_writes = true` for that agent. |
 | `audit log not configured` / `audit log write failed` | The audit log path is missing or unwritable. | Set `audit.path` or ensure the directory exists. |
-| `upstream not configured` / `confluence upstream not configured` | `[atlassian]` section is missing or `base_url`/`token` are empty. | Fill in `base_url` and `token`. |
+| `upstream not configured` / `confluence upstream not configured` | `[atlassian]` section is missing or `base_url`/`token` are empty. | Fill in `email`, `token`, and `cloud_id` (or `base_url` as fallback). |
 | `unsupported tool` | The tool name is not implemented or not in the agent `tools` list. | Use `jira_get_issue`, `jira_create_issue`, or `confluence_get_page`. |
 | Jira returns 401 or 403 | The Atlassian token is invalid or lacks permissions. | Regenerate `ATLASSIAN_TOKEN` and check project access. |
 

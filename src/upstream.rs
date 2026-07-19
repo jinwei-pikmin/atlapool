@@ -1,5 +1,5 @@
 use crate::config::AtlassianConfig;
-use reqwest::{header, Client, Method, Url};
+use reqwest::{Client, Method, Url};
 use serde_json::Value;
 
 #[derive(Debug)]
@@ -24,21 +24,35 @@ impl std::fmt::Display for UpstreamError {
 impl std::error::Error for UpstreamError {}
 
 /// Upstream Jira client. Caller headers are **not** trusted; every request
-/// starts from an empty header set and receives the server-injected
-/// `Authorization` header only.
+/// starts from an empty header set and is authenticated with the server-held
+/// Basic Auth credentials (`email:token`).
 #[derive(Clone)]
 pub struct JiraClient {
     client: Client,
     base_url: String,
+    email: crate::secrets::SecretString,
     token: crate::secrets::SecretString,
 }
 
 impl JiraClient {
+    /// Build the Jira API base URL. Prefer the `api.atlassian.com` gateway using
+    /// `cloud_id`; fall back to `base_url` for tests or legacy configs.
+    fn api_base(config: &AtlassianConfig) -> Result<String, UpstreamError> {
+        if let Some(cloud_id) = &config.cloud_id {
+            Ok(format!("https://api.atlassian.com/ex/jira/{cloud_id}"))
+        } else if let Some(base_url) = &config.base_url {
+            Ok(base_url.trim_end_matches('/').to_string())
+        } else {
+            Err(UpstreamError::MissingConfig("cloud_id or base_url"))
+        }
+    }
+
     pub fn new(config: &AtlassianConfig) -> Result<Self, UpstreamError> {
-        let base_url = config
-            .base_url
+        let base_url = Self::api_base(config)?;
+        let email = config
+            .email
             .clone()
-            .ok_or(UpstreamError::MissingConfig("base_url"))?;
+            .ok_or(UpstreamError::MissingConfig("email"))?;
         let token = config
             .token
             .clone()
@@ -46,13 +60,12 @@ impl JiraClient {
         Ok(Self {
             client: Client::new(),
             base_url,
+            email,
             token,
         })
     }
 
-    /// Build a request from an empty header set, injecting only the server
-    /// bearer token. F2-a uses Bearer injection; the exact Atlassian auth scheme
-    /// (Basic/OAuth) will be aligned in F2-b.
+    /// Build a request from an empty header set, injecting only Basic Auth.
     pub fn request(
         &self,
         method: Method,
@@ -62,9 +75,9 @@ impl JiraClient {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let url = Url::parse(&url).map_err(|_| UpstreamError::InvalidUrl(url.clone()))?;
 
-        let mut builder = self.client.request(method, url).header(
-            header::AUTHORIZATION,
-            format!("Bearer {}", self.token.expose_secret()),
+        let mut builder = self.client.request(method, url).basic_auth(
+            self.email.expose_secret().to_string(),
+            Some(self.token.expose_secret().to_string()),
         );
 
         if let Some(body) = body {
@@ -133,18 +146,29 @@ mod tests {
     fn test_config() -> AtlassianConfig {
         AtlassianConfig {
             base_url: Some("https://example.atlassian.net".into()),
+            email: Some(SecretString::new("agent@example.com")),
+            cloud_id: None,
+            token: Some(SecretString::new("test-token")),
+        }
+    }
+
+    fn cloud_id_config() -> AtlassianConfig {
+        AtlassianConfig {
+            base_url: None,
+            email: Some(SecretString::new("agent@example.com")),
+            cloud_id: Some("test-cloud-id".into()),
             token: Some(SecretString::new("test-token")),
         }
     }
 
     #[test]
-    fn myself_request_injects_bearer_token() {
+    fn myself_request_injects_basic_auth() {
         let client = JiraClient::new(&test_config()).unwrap();
         let request = client.myself_request().unwrap();
         let headers = request.headers();
 
         let auth = headers.get(AUTHORIZATION).unwrap().to_str().unwrap();
-        assert_eq!(auth, "Bearer test-token");
+        assert!(auth.starts_with("Basic "));
     }
 
     #[test]
@@ -169,6 +193,18 @@ mod tests {
     }
 
     #[test]
+    fn myself_request_url_uses_cloud_id_gateway() {
+        let client = JiraClient::new(&cloud_id_config()).unwrap();
+        let request = client.myself_request().unwrap();
+
+        assert_eq!(request.url().host_str(), Some("api.atlassian.com"));
+        assert_eq!(
+            request.url().path(),
+            "/ex/jira/test-cloud-id/rest/api/3/myself"
+        );
+    }
+
+    #[test]
     fn get_issue_request_builds_correct_path() {
         let client = JiraClient::new(&test_config()).unwrap();
         let request = client.get_issue_request("PROJ-123").unwrap();
@@ -181,6 +217,6 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert_eq!(auth, "Bearer test-token");
+        assert!(auth.starts_with("Basic "));
     }
 }
