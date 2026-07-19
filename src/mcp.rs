@@ -321,7 +321,7 @@ fn resolve_target(tool: &str, args: Option<&Value>) -> Result<ToolTarget, String
                 project: None,
                 space: Some(space),
                 method: Method::GET,
-                path: format!("/wiki/rest/api/content/{page_id}?expand=body.storage"),
+                path: format!("/wiki/api/v2/pages/{page_id}?body-format=view"),
                 body: None,
             })
         }
@@ -364,7 +364,7 @@ mod tests {
             port: 0,
             atlassian: Some(AtlassianConfig {
                 base_url: Some(base_url),
-                email: Some(SecretString::new("agent@example.com")),
+                email: None,
                 cloud_id: None,
                 token: Some(SecretString::new("test-token")),
             }),
@@ -391,7 +391,7 @@ mod tests {
             port: 0,
             atlassian: Some(AtlassianConfig {
                 base_url: Some(base_url),
-                email: Some(SecretString::new("agent@example.com")),
+                email: None,
                 cloud_id: None,
                 token: Some(SecretString::new("test-token")),
             }),
@@ -495,7 +495,7 @@ mod tests {
             };
 
         let app = Router::new()
-            .route("/wiki/rest/api/content/{id}", get(get_handler))
+            .route("/wiki/api/v2/pages/{id}", get(get_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -606,7 +606,7 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            "Basic YWdlbnRAZXhhbXBsZS5jb206dGVzdC10b2tlbg=="
+            "Bearer test-token"
         );
         assert!(!upstream_headers.contains_key("x-atlapool-key"));
         assert!(!upstream_headers.contains_key("cookie"));
@@ -812,7 +812,7 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            "Basic YWdlbnRAZXhhbXBsZS5jb206dGVzdC10b2tlbg=="
+            "Bearer test-token"
         );
         assert!(!upstream_headers.contains_key("x-atlapool-key"));
         assert!(!upstream_headers.contains_key("cookie"));
