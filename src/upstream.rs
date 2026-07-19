@@ -2,6 +2,34 @@ use crate::config::AtlassianConfig;
 use reqwest::{header, Client, Method, Url};
 use serde_json::Value;
 
+/// Body payload that an upstream request may carry.
+#[derive(Clone, Debug, Default)]
+pub enum RequestBody {
+    #[default]
+    None,
+    Json(Value),
+    Form(Vec<(String, String)>),
+}
+
+impl RequestBody {
+    pub fn json(v: Value) -> Self {
+        Self::Json(v)
+    }
+
+    pub fn form(fields: Vec<(String, String)>) -> Self {
+        Self::Form(fields)
+    }
+}
+
+impl From<Option<Value>> for RequestBody {
+    fn from(v: Option<Value>) -> Self {
+        match v {
+            Some(v) => RequestBody::Json(v),
+            None => RequestBody::None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum UpstreamError {
     MissingConfig(&'static str),
@@ -64,7 +92,7 @@ impl JiraClient {
         &self,
         method: Method,
         path: &str,
-        body: Option<serde_json::Value>,
+        body: RequestBody,
     ) -> Result<reqwest::Request, UpstreamError> {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let url = Url::parse(&url).map_err(|_| UpstreamError::InvalidUrl(url.clone()))?;
@@ -74,8 +102,10 @@ impl JiraClient {
             format!("Bearer {}", self.token.expose_secret()),
         );
 
-        if let Some(body) = body {
-            builder = builder.json(&body);
+        match body {
+            RequestBody::None => {}
+            RequestBody::Json(v) => builder = builder.json(&v),
+            RequestBody::Form(fields) => builder = builder.form(&fields),
         }
 
         builder.build().map_err(UpstreamError::RequestBuild)
@@ -90,23 +120,27 @@ impl JiraClient {
 
     #[allow(dead_code)]
     pub fn myself_request(&self) -> Result<reqwest::Request, UpstreamError> {
-        self.request(Method::GET, "/rest/api/3/myself", None)
+        self.request(Method::GET, "/rest/api/3/myself", RequestBody::None)
     }
 
     #[allow(dead_code)]
     pub fn get_issue_request(&self, issue_key: &str) -> Result<reqwest::Request, UpstreamError> {
-        self.request(Method::GET, &format!("/rest/api/3/issue/{issue_key}"), None)
+        self.request(
+            Method::GET,
+            &format!("/rest/api/3/issue/{issue_key}"),
+            RequestBody::None,
+        )
     }
 }
 
-/// Abstraction over Jira and Confluence clients so `mcp_handler` can forward
-/// requests without knowing the concrete upstream type.
+/// Abstraction over upstream clients so `mcp_handler` can forward requests
+/// without knowing the concrete upstream type.
 pub trait UpstreamClient: Send + Sync {
     fn build_request(
         &self,
         method: Method,
         path: &str,
-        body: Option<Value>,
+        body: RequestBody,
     ) -> Result<reqwest::Request, UpstreamError>;
 
     async fn execute(&self, request: reqwest::Request)
@@ -118,7 +152,7 @@ impl UpstreamClient for JiraClient {
         &self,
         method: Method,
         path: &str,
-        body: Option<Value>,
+        body: RequestBody,
     ) -> Result<reqwest::Request, UpstreamError> {
         self.request(method, path, body)
     }

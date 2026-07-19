@@ -9,7 +9,7 @@ use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::upstream::UpstreamClient;
+use crate::upstream::{RequestBody, UpstreamClient};
 use crate::{agents, AppState};
 
 const MCP_KEY_HEADER: &str = "x-atlapool-key";
@@ -38,7 +38,7 @@ struct ToolTarget {
     repo: Option<String>,
     method: Method,
     path: String,
-    body: Option<Value>,
+    body: RequestBody,
 }
 
 pub async fn mcp_handler(
@@ -171,6 +171,8 @@ pub async fn mcp_handler(
             .project
             .as_deref()
             .or(target.space.as_deref())
+            .or(target.workspace.as_deref())
+            .or(target.repo.as_deref())
             .unwrap_or("unknown");
 
         if let Err(e) = audit.record_attempt(&agent.id, &params.name, target).await {
@@ -319,7 +321,7 @@ fn resolve_target(
                 space: None,
                 method: Method::GET,
                 path: format!("/rest/api/3/issue/{issue_key}"),
-                body: None,
+                body: RequestBody::None,
             })
         }
         "jira_create_issue" => {
@@ -336,7 +338,7 @@ fn resolve_target(
                 space: None,
                 method: Method::POST,
                 path: "/rest/api/3/issue".into(),
-                body: Some(args.clone()),
+                body: RequestBody::json(args.clone()),
             })
         }
         "jira_add_comment" => {
@@ -354,7 +356,7 @@ fn resolve_target(
                 space: None,
                 method: Method::POST,
                 path: format!("/rest/api/3/issue/{issue_key}/comment"),
-                body: Some(json!({ "body": body })),
+                body: RequestBody::json(json!({ "body": body })),
             })
         }
         "confluence_get_page" => {
@@ -381,7 +383,7 @@ fn resolve_target(
                 space: Some(space),
                 method: Method::GET,
                 path: format!("/wiki/api/v2/pages/{page_id}?body-format=view"),
-                body: None,
+                body: RequestBody::None,
             })
         }
         "confluence_create_page" => {
@@ -423,7 +425,7 @@ fn resolve_target(
                 space: Some(space),
                 method: Method::POST,
                 path: "/wiki/api/v2/pages".into(),
-                body: Some(json!({
+                body: RequestBody::json(json!({
                     "spaceId": space_id,
                     "status": "current",
                     "title": title,
@@ -488,7 +490,7 @@ fn resolve_target(
                 space: Some(space),
                 method: Method::PUT,
                 path: format!("/wiki/api/v2/pages/{page_id}"),
-                body: Some(json!({
+                body: RequestBody::json(json!({
                     "id": page_id,
                     "spaceId": space_id,
                     "status": "current",
@@ -513,7 +515,7 @@ fn resolve_target(
                 space: None,
                 method: Method::GET,
                 path: format!("/repositories/{workspace}/{repo_slug}"),
-                body: None,
+                body: RequestBody::None,
             })
         }
         "bitbucket_get_pull_request" => {
@@ -540,7 +542,161 @@ fn resolve_target(
                 path: format!(
                     "/repositories/{workspace}/{repo_slug}/pullrequests/{pull_request_id}"
                 ),
-                body: None,
+                body: RequestBody::None,
+            })
+        }
+        "bitbucket_create_branch" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let branch_name = args
+                .get("branch_name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or("missing branch_name")?;
+            let target_hash = args
+                .get("target_hash")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or("missing target_hash")?;
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::POST,
+                path: format!("/repositories/{workspace}/{repo_slug}/refs/branches"),
+                body: RequestBody::json(json!({
+                    "name": branch_name,
+                    "target": { "hash": target_hash }
+                })),
+            })
+        }
+        "bitbucket_create_commit" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let message = args
+                .get("message")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or("missing message")?;
+            let branch = args
+                .get("branch")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or("missing branch")?;
+            let parents = if let Some(arr) = args.get("parents").and_then(|v| v.as_array()) {
+                arr.iter()
+                    .map(|v| v.as_str().unwrap_or("").to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let files = args
+                .get("files")
+                .and_then(|v| v.as_object())
+                .ok_or("missing files")?;
+            let files: Vec<(String, String)> = files
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                .filter(|(_, v)| !v.is_empty())
+                .collect();
+            if files.is_empty() {
+                return Err("files must contain at least one non-empty file".into());
+            }
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            let mut form_fields = vec![
+                ("message".into(), message.into()),
+                ("branch".into(), branch.into()),
+            ];
+            for parent in parents {
+                form_fields.push(("parents".into(), parent));
+            }
+            for (path, content) in files {
+                form_fields.push((path, content));
+            }
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::POST,
+                path: format!("/repositories/{workspace}/{repo_slug}/src"),
+                body: RequestBody::form(form_fields),
+            })
+        }
+        "bitbucket_create_pull_request" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let title = args
+                .get("title")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or("missing title")?;
+            let source_branch = args
+                .get("source_branch")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or("missing source_branch")?;
+            let destination_branch = args
+                .get("destination_branch")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let description = args.get("description").and_then(|v| v.as_str());
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            let mut body = json!({
+                "title": title,
+                "source": { "branch": { "name": source_branch } }
+            });
+            if let Some(destination) = destination_branch {
+                body["destination"] = json!({ "branch": { "name": destination } });
+            }
+            if let Some(description) = description {
+                body["description"] = json!(description);
+            }
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::POST,
+                path: format!("/repositories/{workspace}/{repo_slug}/pullrequests"),
+                body: RequestBody::json(body),
+            })
+        }
+        "bitbucket_create_repo" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let is_private = args
+                .get("is_private")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::POST,
+                path: format!("/repositories/{workspace}/{repo_slug}"),
+                body: RequestBody::json(json!({ "is_private": is_private })),
             })
         }
         _ => Err("unsupported tool".into()),
@@ -1719,16 +1875,19 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    async fn mock_bitbucket_server() -> (u16, Arc<Mutex<Vec<HeaderMap>>>) {
+    async fn mock_bitbucket_server() -> (u16, Arc<Mutex<Vec<HeaderMap>>>, Arc<Mutex<Vec<String>>>) {
         #[derive(Clone)]
         struct MockState {
             headers: Arc<Mutex<Vec<HeaderMap>>>,
+            bodies: Arc<Mutex<Vec<String>>>,
         }
 
         let state = MockState {
             headers: Arc::new(Mutex::new(Vec::new())),
+            bodies: Arc::new(Mutex::new(Vec::new())),
         };
-        let captured = state.headers.clone();
+        let captured_headers = state.headers.clone();
+        let captured_bodies = state.bodies.clone();
 
         let repo_handler = |State(s): State<MockState>,
                             Path((workspace, repo)): Path<(String, String)>,
@@ -1752,11 +1911,77 @@ mod tests {
             }))
         };
 
+        let create_repo_handler = |State(s): State<MockState>,
+                                   Path((workspace, repo)): Path<(String, String)>,
+                                   headers: HeaderMap,
+                                   body: String| async move {
+            s.headers.lock().unwrap().push(headers);
+            s.bodies.lock().unwrap().push(body);
+            Json(json!({
+                "full_name": format!("{workspace}/{repo}"),
+                "name": repo,
+                "is_private": true
+            }))
+        };
+
+        let create_branch_handler = |State(s): State<MockState>,
+                                     Path((workspace, repo)): Path<(String, String)>,
+                                     headers: HeaderMap,
+                                     body: String| async move {
+            s.headers.lock().unwrap().push(headers);
+            s.bodies.lock().unwrap().push(body);
+            Json(json!({
+                "name": "created-branch",
+                "target": { "hash": "abc" },
+                "repository": { "full_name": format!("{workspace}/{repo}") }
+            }))
+        };
+
+        let create_pr_handler = |State(s): State<MockState>,
+                                 Path((workspace, repo)): Path<(String, String)>,
+                                 headers: HeaderMap,
+                                 body: String| async move {
+            s.headers.lock().unwrap().push(headers);
+            s.bodies.lock().unwrap().push(body);
+            Json(json!({
+                "id": "99",
+                "title": "created PR",
+                "source": { "repository": { "full_name": format!("{workspace}/{repo}") } }
+            }))
+        };
+
+        let create_commit_handler = |State(s): State<MockState>,
+                                     Path((workspace, repo)): Path<(String, String)>,
+                                     headers: HeaderMap,
+                                     body: String| async move {
+            s.headers.lock().unwrap().push(headers);
+            s.bodies.lock().unwrap().push(body);
+            Json(json!({
+                "hash": "commit-hash",
+                "repository": { "full_name": format!("{workspace}/{repo}") }
+            }))
+        };
+
         let app = Router::new()
-            .route("/repositories/{workspace}/{repo}", get(repo_handler))
+            .route(
+                "/repositories/{workspace}/{repo}",
+                get(repo_handler).post(create_repo_handler),
+            )
             .route(
                 "/repositories/{workspace}/{repo}/pullrequests/{pr_id}",
                 get(pr_handler),
+            )
+            .route(
+                "/repositories/{workspace}/{repo}/refs/branches",
+                post(create_branch_handler),
+            )
+            .route(
+                "/repositories/{workspace}/{repo}/pullrequests",
+                post(create_pr_handler),
+            )
+            .route(
+                "/repositories/{workspace}/{repo}/src",
+                post(create_commit_handler),
             )
             .with_state(state);
 
@@ -1767,12 +1992,12 @@ mod tests {
         // Give the server a moment to start listening.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-        (port, captured)
+        (port, captured_headers, captured_bodies)
     }
 
     #[tokio::test]
     async fn mcp_bitbucket_get_repo_allowed_and_strips_headers() {
-        let (port, captured) = mock_bitbucket_server().await;
+        let (port, captured, _bodies) = mock_bitbucket_server().await;
         let config = bitbucket_test_config(
             format!("http://127.0.0.1:{}", port),
             None,
@@ -1820,7 +2045,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_bitbucket_get_pull_request_allowed() {
-        let (port, captured) = mock_bitbucket_server().await;
+        let (port, captured, _bodies) = mock_bitbucket_server().await;
         let config = bitbucket_test_config(
             format!("http://127.0.0.1:{}", port),
             None,
@@ -1866,7 +2091,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_bitbucket_get_repo_forbidden_repo_returns_403() {
-        let (port, _captured) = mock_bitbucket_server().await;
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
         let config = bitbucket_test_config(
             format!("http://127.0.0.1:{}", port),
             None,
@@ -1924,7 +2149,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_bitbucket_get_repo_rejects_invalid_pull_request_id() {
-        let (port, _captured) = mock_bitbucket_server().await;
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
         let config = bitbucket_test_config(
             format!("http://127.0.0.1:{}", port),
             None,
@@ -1954,7 +2179,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_bitbucket_get_repo_rejects_path_traversal_in_repo_slug() {
-        let (port, _captured) = mock_bitbucket_server().await;
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
         let config = bitbucket_test_config(
             format!("http://127.0.0.1:{}", port),
             None,
@@ -1984,7 +2209,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_bitbucket_get_pull_request_rejects_path_traversal_in_repo_slug() {
-        let (port, _captured) = mock_bitbucket_server().await;
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
         let config = bitbucket_test_config(
             format!("http://127.0.0.1:{}", port),
             None,
@@ -2010,5 +2235,237 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn bitbucket_write_test_config(
+        base_url: String,
+        tools: Vec<String>,
+        enable_writes: bool,
+    ) -> (Config, String) {
+        let audit_path = temp_audit_path();
+        let mut config = bitbucket_test_config(
+            base_url,
+            Some(audit_path.clone()),
+            vec!["WORK".into()],
+            vec!["*".into()],
+        );
+        config.agents[0].enable_writes = enable_writes;
+        config.agents[0].tools = tools;
+        (config, audit_path)
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_create_repo_defaults_to_private_and_writes_audit() {
+        let (port, _captured, bodies) = mock_bitbucket_server().await;
+        let (config, audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_create_repo".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: Some(AuditLog::new(audit_path.clone())),
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_create_repo",
+                json!({"repo_slug": "new-repo"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = bodies.lock().unwrap().pop().unwrap();
+        let upstream: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(upstream["is_private"], true);
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        let line = log.trim();
+        assert!(line.contains("\"agent_id\":\"demo\""));
+        assert!(line.contains("\"tool\":\"bitbucket_create_repo\""));
+        assert!(line.contains("\"result\":\"attempt\""));
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_create_repo_write_disabled_returns_403() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let (config, _audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_create_repo".into()],
+            false,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_create_repo",
+                json!({"repo_slug": "new-repo"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_create_repo_audit_failure_rejected() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let (config, _audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_create_repo".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: Some(AuditLog::new("/nonexistent-dir/atlapool-audit.jsonl")),
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_create_repo",
+                json!({"repo_slug": "new-repo"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_create_branch_allowed() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let (config, audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_create_branch".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: Some(AuditLog::new(audit_path.clone())),
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_create_branch",
+                json!({"repo_slug": "my-repo", "branch_name": "feature/x", "target_hash": "abc123"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_create_commit_allowed_with_form_body() {
+        let (port, _captured, bodies) = mock_bitbucket_server().await;
+        let (config, audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_create_commit".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: Some(AuditLog::new(audit_path.clone())),
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_create_commit",
+                json!({
+                    "repo_slug": "my-repo",
+                    "message": "commit msg",
+                    "branch": "main",
+                    "files": { "README.md": "hello" }
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = bodies.lock().unwrap().pop().unwrap();
+        assert!(body.contains("message=commit+msg"));
+        assert!(body.contains("branch=main"));
+        assert!(body.contains("README.md=hello"));
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_create_pull_request_allowed() {
+        let (port, _captured, bodies) = mock_bitbucket_server().await;
+        let (config, audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_create_pull_request".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: Some(AuditLog::new(audit_path.clone())),
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_create_pull_request",
+                json!({
+                    "repo_slug": "my-repo",
+                    "title": "PR title",
+                    "source_branch": "feature/x",
+                    "destination_branch": "main",
+                    "description": "desc"
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = bodies.lock().unwrap().pop().unwrap();
+        let upstream: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(upstream["title"], "PR title");
+
+        std::fs::remove_file(&audit_path).ok();
     }
 }

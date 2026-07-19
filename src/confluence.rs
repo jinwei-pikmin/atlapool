@@ -1,8 +1,6 @@
 use crate::config::AtlassianConfig;
-use crate::upstream::UpstreamClient;
-use crate::upstream::UpstreamError;
+use crate::upstream::{RequestBody, UpstreamClient, UpstreamError};
 use reqwest::{header, Client, Method, Url};
-use serde_json::Value;
 
 /// Confluence Cloud REST client. Caller headers are **not** trusted; every
 /// request starts from an empty header set and receives the server-injected
@@ -47,7 +45,7 @@ impl ConfluenceClient {
         &self,
         method: Method,
         path: &str,
-        body: Option<Value>,
+        body: RequestBody,
     ) -> Result<reqwest::Request, UpstreamError> {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let url = Url::parse(&url).map_err(|_| UpstreamError::InvalidUrl(url.clone()))?;
@@ -57,8 +55,10 @@ impl ConfluenceClient {
             format!("Bearer {}", self.token.expose_secret()),
         );
 
-        if let Some(body) = body {
-            builder = builder.json(&body);
+        match body {
+            RequestBody::None => {}
+            RequestBody::Json(v) => builder = builder.json(&v),
+            RequestBody::Form(fields) => builder = builder.form(&fields),
         }
 
         builder.build().map_err(UpstreamError::RequestBuild)
@@ -76,7 +76,7 @@ impl ConfluenceClient {
         self.request(
             Method::GET,
             &format!("/wiki/api/v2/pages/{page_id}?body-format=view"),
-            None,
+            RequestBody::None,
         )
     }
 }
@@ -86,7 +86,7 @@ impl UpstreamClient for ConfluenceClient {
         &self,
         method: Method,
         path: &str,
-        body: Option<Value>,
+        body: RequestBody,
     ) -> Result<reqwest::Request, UpstreamError> {
         self.request(method, path, body)
     }
