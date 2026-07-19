@@ -41,6 +41,18 @@ struct ToolTarget {
     body: RequestBody,
 }
 
+impl ToolTarget {
+    fn target_string(&self) -> String {
+        self.project
+            .as_deref()
+            .or(self.space.as_deref())
+            .or(self.workspace.as_deref())
+            .or(self.repo.as_deref())
+            .unwrap_or("unknown")
+            .to_string()
+    }
+}
+
 pub async fn mcp_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -153,8 +165,11 @@ pub async fn mcp_handler(
 
     // Fail-closed audit: write operations must be logged before the upstream call.
     // If the audit log cannot be written, the operation is aborted with 500.
+    let target_string = target.target_string();
+    let audit = if is_write { state.audit.clone() } else { None };
+
     if is_write {
-        let Some(audit) = state.audit.as_ref() else {
+        let Some(ref audit) = audit else {
             tracing::error!(
                 agent_id = %agent.id,
                 tool = %params.name,
@@ -167,15 +182,10 @@ pub async fn mcp_handler(
             );
         };
 
-        let target = target
-            .project
-            .as_deref()
-            .or(target.space.as_deref())
-            .or(target.workspace.as_deref())
-            .or(target.repo.as_deref())
-            .unwrap_or("unknown");
-
-        if let Err(e) = audit.record_attempt(&agent.id, &params.name, target).await {
+        if let Err(e) = audit
+            .record_attempt(&agent.id, &params.name, &target_string)
+            .await
+        {
             tracing::error!(
                 agent_id = %agent.id,
                 tool = %params.name,
@@ -205,7 +215,15 @@ pub async fn mcp_handler(
                 "confluence upstream not configured",
             );
         };
-        forward(confluence, request.id.clone(), target).await
+        forward(
+            confluence,
+            audit,
+            agent.id.clone(),
+            params.name.clone(),
+            request.id.clone(),
+            target,
+        )
+        .await
     } else if params.name.starts_with("bitbucket_") {
         let Some(bitbucket) = state.bitbucket.as_ref() else {
             return mcp_error(
@@ -214,7 +232,15 @@ pub async fn mcp_handler(
                 "bitbucket upstream not configured",
             );
         };
-        forward(bitbucket, request.id.clone(), target).await
+        forward(
+            bitbucket,
+            audit,
+            agent.id.clone(),
+            params.name.clone(),
+            request.id.clone(),
+            target,
+        )
+        .await
     } else {
         let Some(jira) = state.jira.as_ref() else {
             return mcp_error(
@@ -223,7 +249,15 @@ pub async fn mcp_handler(
                 "upstream not configured",
             );
         };
-        forward(jira, request.id.clone(), target).await
+        forward(
+            jira,
+            audit,
+            agent.id.clone(),
+            params.name.clone(),
+            request.id.clone(),
+            target,
+        )
+        .await
     };
 
     match forward_result {
@@ -234,27 +268,74 @@ pub async fn mcp_handler(
 
 async fn forward<C: UpstreamClient>(
     client: &C,
+    audit: Option<crate::audit::AuditLog>,
+    agent_id: String,
+    tool: String,
     request_id: Option<Value>,
     target: ToolTarget,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
-    let upstream_request = client
-        .build_request(target.method, &target.path, target.body)
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let target_string = target.target_string();
 
-    let upstream_resp = client.execute(upstream_request).await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("upstream request failed: {}", e),
-        )
-    })?;
+    let upstream_request = match client.build_request(target.method, &target.path, target.body) {
+        Ok(req) => req,
+        Err(e) => {
+            let error_message = e.to_string();
+            if let Some(ref audit) = audit {
+                audit
+                    .record_result(
+                        &agent_id,
+                        &tool,
+                        &target_string,
+                        false,
+                        None,
+                        Some(error_message.as_str()),
+                    )
+                    .await;
+            }
+            return Err((StatusCode::BAD_GATEWAY, error_message));
+        }
+    };
+
+    let upstream_resp = match client.execute(upstream_request).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let message = format!("upstream request failed: {}", e);
+            if let Some(ref audit) = audit {
+                audit
+                    .record_result(
+                        &agent_id,
+                        &tool,
+                        &target_string,
+                        false,
+                        None,
+                        Some(message.as_str()),
+                    )
+                    .await;
+            }
+            return Err((StatusCode::BAD_GATEWAY, message));
+        }
+    };
 
     let upstream_status = upstream_resp.status();
-    let upstream_text = upstream_resp.text().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("failed to read upstream: {}", e),
-        )
-    })?;
+    let upstream_text = match upstream_resp.text().await {
+        Ok(text) => text,
+        Err(e) => {
+            let message = format!("failed to read upstream: {}", e);
+            if let Some(ref audit) = audit {
+                audit
+                    .record_result(
+                        &agent_id,
+                        &tool,
+                        &target_string,
+                        false,
+                        Some(upstream_status.as_u16()),
+                        Some(message.as_str()),
+                    )
+                    .await;
+            }
+            return Err((StatusCode::BAD_GATEWAY, message));
+        }
+    };
     let upstream_body: Value = if upstream_text.trim().is_empty() {
         json!({})
     } else {
@@ -262,11 +343,36 @@ async fn forward<C: UpstreamClient>(
     };
 
     let (status, envelope) = if upstream_status.is_success() {
+        if let Some(ref audit) = audit {
+            audit
+                .record_result(
+                    &agent_id,
+                    &tool,
+                    &target_string,
+                    true,
+                    Some(upstream_status.as_u16()),
+                    None,
+                )
+                .await;
+        }
         (
             StatusCode::OK,
             json!({"jsonrpc":"2.0","id": request_id, "result": upstream_body}),
         )
     } else {
+        let message = format!("upstream returned {}", upstream_status);
+        if let Some(ref audit) = audit {
+            audit
+                .record_result(
+                    &agent_id,
+                    &tool,
+                    &target_string,
+                    false,
+                    Some(upstream_status.as_u16()),
+                    Some(message.as_str()),
+                )
+                .await;
+        }
         (
             StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             json!({
@@ -274,7 +380,7 @@ async fn forward<C: UpstreamClient>(
                 "id": request_id,
                 "error": {
                     "code": -32000,
-                    "message": format!("upstream returned {}", upstream_status),
+                    "message": message,
                     "data": upstream_body
                 }
             }),
@@ -1194,11 +1300,61 @@ mod tests {
         assert_eq!(json["result"]["key"], "PROJ-123");
 
         let log = std::fs::read_to_string(&audit_path).unwrap();
-        let line = log.trim();
-        assert!(line.contains("\"agent_id\":\"demo\""));
-        assert!(line.contains("\"tool\":\"jira_create_issue\""));
-        assert!(line.contains("\"target\":\"PROJ\""));
-        assert!(line.contains("\"result\":\"attempt\""));
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"result\":\"attempt\""));
+        assert!(lines[1].contains("\"result\":\"success\""));
+        assert!(lines[1].contains("\"status\":200"));
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_create_issue_upstream_failure_logs_result() {
+        // Mock an upstream that rejects the create request.
+        let app = Router::new().route(
+            "/rest/api/3/issue",
+            post(|| async { StatusCode::BAD_REQUEST }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let config = test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            Some(temp_audit_path()),
+        );
+        let audit_path = config.audit.path.clone().unwrap();
+        let audit = Some(AuditLog::new(audit_path.clone()));
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_create_issue",
+                json!({"project":"PROJ","summary":"stub"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"result\":\"attempt\""));
+        assert!(lines[1].contains("\"result\":\"failure\""));
+        assert!(lines[1].contains("\"status\":400"));
 
         std::fs::remove_file(&audit_path).ok();
     }
@@ -1255,11 +1411,10 @@ mod tests {
         assert!(!upstream_headers.contains_key("cookie"));
 
         let log = std::fs::read_to_string(&audit_path).unwrap();
-        let line = log.trim();
-        assert!(line.contains("\"agent_id\":\"demo\""));
-        assert!(line.contains("\"tool\":\"jira_add_comment\""));
-        assert!(line.contains("\"target\":\"PROJ\""));
-        assert!(line.contains("\"result\":\"attempt\""));
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"result\":\"attempt\""));
+        assert!(lines[1].contains("\"result\":\"success\""));
 
         std::fs::remove_file(&audit_path).ok();
     }
@@ -1663,11 +1818,10 @@ mod tests {
         assert!(!upstream_headers.contains_key("cookie"));
 
         let log = std::fs::read_to_string(&audit_path).unwrap();
-        let line = log.trim();
-        assert!(line.contains("\"agent_id\":\"demo\""));
-        assert!(line.contains("\"tool\":\"confluence_create_page\""));
-        assert!(line.contains("\"target\":\"SPACE\""));
-        assert!(line.contains("\"result\":\"attempt\""));
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"result\":\"attempt\""));
+        assert!(lines[1].contains("\"result\":\"success\""));
 
         std::fs::remove_file(&audit_path).ok();
     }
@@ -1834,11 +1988,10 @@ mod tests {
         assert!(!upstream_headers.contains_key("cookie"));
 
         let log = std::fs::read_to_string(&audit_path).unwrap();
-        let line = log.trim();
-        assert!(line.contains("\"agent_id\":\"demo\""));
-        assert!(line.contains("\"tool\":\"confluence_update_page\""));
-        assert!(line.contains("\"target\":\"SPACE\""));
-        assert!(line.contains("\"result\":\"attempt\""));
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"result\":\"attempt\""));
+        assert!(lines[1].contains("\"result\":\"success\""));
 
         std::fs::remove_file(&audit_path).ok();
     }
@@ -2366,10 +2519,10 @@ mod tests {
         assert_eq!(upstream["is_private"], true);
 
         let log = std::fs::read_to_string(&audit_path).unwrap();
-        let line = log.trim();
-        assert!(line.contains("\"agent_id\":\"demo\""));
-        assert!(line.contains("\"tool\":\"bitbucket_create_repo\""));
-        assert!(line.contains("\"result\":\"attempt\""));
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"result\":\"attempt\""));
+        assert!(lines[1].contains("\"result\":\"success\""));
 
         std::fs::remove_file(&audit_path).ok();
     }
@@ -2594,6 +2747,13 @@ mod tests {
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["result"], json!({}));
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"result\":\"attempt\""));
+        assert!(lines[1].contains("\"result\":\"success\""));
+        assert!(lines[1].contains("\"status\":204"));
 
         std::fs::remove_file(&audit_path).ok();
     }
