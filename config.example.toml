@@ -30,7 +30,12 @@ port = 8080
 # cloud_id = "aws:secretsmanager:prod/atlassian/cloud-id"
 
 # Server-injected token sent as `Authorization: Bearer <token>`.
-# For Service Account scoped tokens, store the token here.
+# For Service Account scoped tokens, store the token here and grant the needed
+# Atlassian OAuth scopes in the Atlassian admin console:
+#   - Jira: read:jira-work / write:jira-work
+#   - Confluence: read:page:confluence, write:page:confluence,
+#                 read:comment:confluence, write:comment:confluence,
+#                 read:attachment:confluence, write:attachment:confluence
 # Choose one of the secret reference examples below:
 # token = "env:ATLASSIAN_TOKEN"                       # local environment variable
 # token = "aws:secretsmanager:prod/atlassian/token"   # AWS Secrets Manager

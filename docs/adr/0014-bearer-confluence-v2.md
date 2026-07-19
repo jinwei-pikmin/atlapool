@@ -17,11 +17,15 @@ PR #31 引入 Basic Auth（`Authorization: Basic <base64(email:token)>`）與 Co
 3. `ConfluenceClient::get_page_request` 與 `mcp.rs resolve_target` 改回 V2 路徑：
    - `/wiki/api/v2/pages/{page_id}?body-format=view`
 4. 生產環境仍透過 `cloud_id` 走 `api.atlassian.com` 閘道；`base_url` 維持為測試/人類可讀連結的 fallback。
-5. README / `config.example.toml` 同步更新：
+5. 文件同步記錄所需 Atlassian OAuth scopes：
+   - Jira: `read:jira-work` / `write:jira-work`
+   - Confluence: `read:page:confluence`, `write:page:confluence`, `read:comment:confluence`, `write:comment:confluence`, `read:attachment:confluence`, `write:attachment:confluence`
+6. README / `config.example.toml` 同步更新：
    - 說明 Service Account scoped token 使用 Bearer
    - Confluence 使用 V2 API
    - `email` 註解改為可選
-6. 單元與 E2E 測試更新：
+   - 列出 Jira / Confluence 所需 scopes
+7. 單元與 E2E 測試更新：
    - `Authorization` header 預期從 `Basic ...` 改回 `Bearer test-token`
    - Confluence mock 路由改回 `/wiki/api/v2/pages/{id}`
 

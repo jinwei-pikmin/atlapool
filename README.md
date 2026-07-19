@@ -254,6 +254,11 @@ For Service Account scoped tokens you need two values:
 
 1. **Scoped token** — a Service Account token with the required Atlassian OAuth
    scopes. atlapool sends it as `Authorization: Bearer <token>`.
+   Required scopes:
+   - Jira (OAuth-style): `read:jira-work` and/or `write:jira-work`
+   - Confluence (granular): `read:page:confluence`, `write:page:confluence`,
+     `read:comment:confluence`, `write:comment:confluence`,
+     `read:attachment:confluence`, `write:attachment:confluence`
 2. **Cloud ID** — the unique identifier of your Atlassian Cloud site. To find it,
    sign in to your site and open:
 
