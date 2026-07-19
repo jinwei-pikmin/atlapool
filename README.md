@@ -723,6 +723,18 @@ Audit guarantee:
   is logged by the server but does not abort the already-completed upstream
   call.
 
+Each audit line is a JSON object with the fields from `src/audit.rs`:
+
+| Field | Type | Present in | Meaning |
+|---|---|---|---|
+| `agent_id` | string | always | Agent identifier from `config.toml`. |
+| `tool` | string | always | MCP tool name that was called. |
+| `target` | string | always | Allowlist dimension used for the call (`project`, `space`, `workspace`, or `repo` slug). |
+| `timestamp` | string | always | RFC 3339 UTC timestamp. |
+| `result` | string | always | `"attempt"`, `"success"`, or `"failure"`. |
+| `status` | number | `success` / `failure` only | Upstream HTTP status code; `0` when the request never reached upstream. |
+| `message` | string | `failure` only | Human-readable error or upstream response summary. |
+
 ### Credential model
 
 atlapool forwards the **same long-lived Service Account token** to every
