@@ -78,11 +78,11 @@ enabled = false
 #
 # tools: exact tool names this agent may call.
 # Implemented tools: jira_get_issue, jira_create_issue, jira_add_comment,
-#   confluence_get_page, confluence_create_page
+#   confluence_get_page, confluence_create_page, confluence_update_page
 # tools = ["jira_get_issue", "jira_create_issue", "jira_add_comment",
-#          "confluence_get_page", "confluence_create_page"]
+#          "confluence_get_page", "confluence_create_page", "confluence_update_page"]
 #
 # enable_writes: must be true for any non-read tool (jira_create_issue, jira_add_comment,
-# confluence_create_page).
+# confluence_create_page, confluence_update_page).
 # Read tools such as jira_get_issue and confluence_get_page work when false.
 # enable_writes = false
