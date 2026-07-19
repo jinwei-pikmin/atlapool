@@ -41,7 +41,7 @@ impl ConfluenceClient {
     }
 
     /// Build a request from an empty header set, injecting only the bearer token.
-    pub fn request(
+    pub async fn request(
         &self,
         method: Method,
         path: &str,
@@ -72,23 +72,24 @@ impl ConfluenceClient {
     }
 
     #[allow(dead_code)]
-    pub fn get_page_request(&self, page_id: &str) -> Result<reqwest::Request, UpstreamError> {
+    pub async fn get_page_request(&self, page_id: &str) -> Result<reqwest::Request, UpstreamError> {
         self.request(
             Method::GET,
             &format!("/wiki/api/v2/pages/{page_id}?body-format=view"),
             RequestBody::None,
         )
+        .await
     }
 }
 
 impl UpstreamClient for ConfluenceClient {
-    fn build_request(
+    async fn build_request(
         &self,
         method: Method,
         path: &str,
         body: RequestBody,
     ) -> Result<reqwest::Request, UpstreamError> {
-        self.request(method, path, body)
+        self.request(method, path, body).await
     }
 
     async fn execute(
@@ -123,30 +124,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn get_page_request_injects_bearer_token() {
+    #[tokio::test]
+    async fn get_page_request_injects_bearer_token() {
         let client = ConfluenceClient::new(&test_config()).unwrap();
-        let request = client.get_page_request("12345").unwrap();
+        let request = client.get_page_request("12345").await.unwrap();
         let headers = request.headers();
 
         let auth = headers.get(AUTHORIZATION).unwrap().to_str().unwrap();
         assert_eq!(auth, "Bearer test-token");
     }
 
-    #[test]
-    fn get_page_request_drops_caller_sensitive_headers() {
+    #[tokio::test]
+    async fn get_page_request_drops_caller_sensitive_headers() {
         let client = ConfluenceClient::new(&test_config()).unwrap();
-        let request = client.get_page_request("12345").unwrap();
+        let request = client.get_page_request("12345").await.unwrap();
         let headers = request.headers();
 
         assert!(!headers.contains_key(COOKIE));
         assert_eq!(headers.get_all(AUTHORIZATION).iter().count(), 1);
     }
 
-    #[test]
-    fn get_page_request_builds_correct_path() {
+    #[tokio::test]
+    async fn get_page_request_builds_correct_path() {
         let client = ConfluenceClient::new(&test_config()).unwrap();
-        let request = client.get_page_request("12345").unwrap();
+        let request = client.get_page_request("12345").await.unwrap();
 
         assert_eq!(request.method(), Method::GET);
         assert_eq!(request.url().path(), "/wiki/api/v2/pages/12345");
@@ -154,10 +155,10 @@ mod tests {
         assert!(query.contains(&"body-format=view"));
     }
 
-    #[test]
-    fn get_page_request_url_uses_cloud_id_gateway() {
+    #[tokio::test]
+    async fn get_page_request_url_uses_cloud_id_gateway() {
         let client = ConfluenceClient::new(&cloud_id_config()).unwrap();
-        let request = client.get_page_request("12345").unwrap();
+        let request = client.get_page_request("12345").await.unwrap();
 
         assert_eq!(request.url().host_str(), Some("api.atlassian.com"));
         assert_eq!(

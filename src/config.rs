@@ -45,6 +45,20 @@ pub struct BitbucketConfig {
     pub base_url: Option<String>,
     pub workspace: Option<String>,
     pub token: Option<crate::secrets::SecretString>,
+    pub oauth: Option<BitbucketOAuthConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct BitbucketOAuthConfig {
+    pub client_id: Option<crate::secrets::SecretString>,
+    pub client_secret: Option<crate::secrets::SecretString>,
+    #[serde(default = "default_bitbucket_token_url")]
+    pub token_url: String,
+}
+
+fn default_bitbucket_token_url() -> String {
+    "https://bitbucket.org/site/oauth2/access_token".to_string()
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -118,6 +132,22 @@ impl Config {
                 if crate::secrets::is_secret_reference(s) {
                     let resolved = crate::secrets::resolve(backend, s).await?;
                     bitbucket.token = Some(crate::secrets::SecretString::new(resolved));
+                }
+            }
+            if let Some(ref mut oauth) = bitbucket.oauth {
+                if let Some(client_id) = oauth.client_id.as_ref() {
+                    let s = client_id.expose_secret();
+                    if crate::secrets::is_secret_reference(s) {
+                        let resolved = crate::secrets::resolve(backend, s).await?;
+                        oauth.client_id = Some(crate::secrets::SecretString::new(resolved));
+                    }
+                }
+                if let Some(client_secret) = oauth.client_secret.as_ref() {
+                    let s = client_secret.expose_secret();
+                    if crate::secrets::is_secret_reference(s) {
+                        let resolved = crate::secrets::resolve(backend, s).await?;
+                        oauth.client_secret = Some(crate::secrets::SecretString::new(resolved));
+                    }
                 }
             }
         }

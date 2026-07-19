@@ -1,6 +1,7 @@
 mod agents;
 mod audit;
 mod bitbucket;
+mod bitbucket_token;
 mod config;
 mod confluence;
 mod mcp;
