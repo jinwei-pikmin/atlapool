@@ -610,8 +610,28 @@ audit log.
 Write tools (`jira_create_issue`, `jira_add_comment`, `confluence_create_page`,
 `confluence_update_page`, `bitbucket_create_repo`, `bitbucket_create_branch`,
 `bitbucket_create_commit`, `bitbucket_create_pull_request`) require
-`enable_writes = true` and a configured `audit.path`. If audit logging fails, the
-request is rejected before the upstream call.
+`enable_writes = true` and a configured `audit.path`.
+
+Audit guarantee:
+
+- **Pre-flight `attempt` record:** written before the upstream call. If this
+  write fails, the request is rejected immediately (fail-closed).
+- **Post-flight `result` record:** written after the upstream call returns.
+  `result` is `"success"` when the upstream status is 2xx (including 204 and
+  empty bodies) and `"failure"` for 4xx/5xx or connection errors. If the result
+  record write fails, the response to the caller is still returned; the failure
+  is logged by the server but does not abort the already-completed upstream
+  call.
+
+### Credential model
+
+atlapool forwards the **same long-lived Service Account token** to every
+upstream request (`Authorization: Bearer <token>`). It does **not** mint
+per-repo or per-session short-lived tokens. This means the configured token
+must have enough scope for all operations the agent may perform, and a
+compromised token can be used for any allowed resource. Per-request short-lived
+credential minting is a known architectural limitation planned for a future
+release.
 
 ## Testing with a mock upstream
 

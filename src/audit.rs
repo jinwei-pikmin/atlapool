@@ -17,6 +17,10 @@ struct AuditRecord {
     target: String,
     timestamp: String,
     result: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 impl AuditLog {
@@ -40,9 +44,46 @@ impl AuditLog {
             target: target.to_string(),
             timestamp: rfc3339_now(),
             result: "attempt".to_string(),
+            status: None,
+            message: None,
         };
 
-        let line = serde_json::to_vec(&record)
+        self.write_record(&record).await
+    }
+
+    /// Record the outcome of a write operation after the upstream call completes.
+    /// This is best-effort logging: failures here are logged but do not change
+    /// the response already returned to the caller.
+    pub async fn record_result(
+        &self,
+        agent_id: &str,
+        tool: &str,
+        target: &str,
+        success: bool,
+        status: Option<u16>,
+        message: Option<&str>,
+    ) {
+        let record = AuditRecord {
+            agent_id: agent_id.to_string(),
+            tool: tool.to_string(),
+            target: target.to_string(),
+            timestamp: rfc3339_now(),
+            result: if success {
+                "success".to_string()
+            } else {
+                "failure".to_string()
+            },
+            status,
+            message: message.map(|m| m.to_string()),
+        };
+
+        if let Err(e) = self.write_record(&record).await {
+            tracing::error!(error = %e, "failed to write audit result record");
+        }
+    }
+
+    async fn write_record(&self, record: &AuditRecord) -> Result<(), io::Error> {
+        let line = serde_json::to_vec(record)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         let mut file = OpenOptions::new()
@@ -68,6 +109,7 @@ fn rfc3339_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn temp_path() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -113,5 +155,27 @@ mod tests {
             .record_attempt("demo", "jira_create_issue", "PROJ")
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn record_result_appends_success_and_failure_lines() {
+        let path = temp_path();
+        let log = AuditLog::new(&path);
+
+        log.record_attempt("demo", "jira_create_issue", "PROJ")
+            .await
+            .unwrap();
+        log.record_result("demo", "jira_create_issue", "PROJ", true, Some(201), None)
+            .await;
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+
+        let success: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(success["result"], "success");
+        assert_eq!(success["status"], 201);
+
+        std::fs::remove_file(&path).ok();
     }
 }
