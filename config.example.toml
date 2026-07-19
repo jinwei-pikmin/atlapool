@@ -42,6 +42,19 @@ port = 8080
 # token = "gcp:secretmanager:my-project/atlassian-token"  # GCP Secret Manager latest
 # token = "gcp:secretmanager:projects/my-project/secrets/atlassian-token/versions/1"
 
+[bitbucket]
+# Bitbucket Cloud credentials. `workspace` is used as the default workspace for
+# all bitbucket_* tool calls. `token` is sent as `Authorization: Bearer <token>`.
+# `base_url` is optional and defaults to the Bitbucket Cloud REST API gateway
+# (https://api.bitbucket.org/2.0); override it for tests or private installs.
+# workspace = "my-workspace"
+# base_url = "https://api.bitbucket.org/2.0"
+#
+# token supports the same secret reference formats as atlassian.token:
+# token = "env:BITBUCKET_TOKEN"
+# token = "aws:secretsmanager:prod/bitbucket/token"
+# token = "gcp:secretmanager:my-project/bitbucket-token"
+
 [mcp]
 # Reserved fields. The server currently does not gate the /mcp endpoint on
 # `enabled` nor apply a global `enable_writes` default. The /health and /stats
@@ -76,13 +89,21 @@ enabled = false
 # spaces: Confluence space keys the agent may access. Supports glob '*'.
 # spaces = ["SPACE-Y", "SPACE/*"]
 #
+# bitbucket_workspaces: Bitbucket workspace slugs the agent may access. Supports glob '*'.
+# bitbucket_workspaces = ["WORKSPACE", "WORKSPACE/*"]
+#
+# bitbucket_repos: Bitbucket repository slugs the agent may access. Supports glob '*'.
+# bitbucket_repos = ["my-repo", "my-repo/*"]
+#
 # tools: exact tool names this agent may call.
 # Implemented tools: jira_get_issue, jira_create_issue, jira_add_comment,
-#   confluence_get_page, confluence_create_page, confluence_update_page
+#   confluence_get_page, confluence_create_page, confluence_update_page,
+#   bitbucket_get_repo, bitbucket_get_pull_request
 # tools = ["jira_get_issue", "jira_create_issue", "jira_add_comment",
-#          "confluence_get_page", "confluence_create_page", "confluence_update_page"]
+#          "confluence_get_page", "confluence_create_page", "confluence_update_page",
+#          "bitbucket_get_repo", "bitbucket_get_pull_request"]
 #
 # enable_writes: must be true for any non-read tool (jira_create_issue, jira_add_comment,
-# confluence_create_page, confluence_update_page).
-# Read tools such as jira_get_issue and confluence_get_page work when false.
+# confluence_create_page, confluence_update_page). Bitbucket read tools do not need writes.
+# Read tools such as jira_get_issue, confluence_get_page, bitbucket_get_repo work when false.
 # enable_writes = false
