@@ -256,7 +256,7 @@ Call `POST /mcp` with a JSON-RPC 2.0 envelope:
 | `jira_create_issue` | Create a Jira issue | `project`, `summary`, plus any Jira `fields` | `projects` (from `project`) | Yes (`enable_writes = true`) | Yes |
 | `jira_add_comment` | Add a comment to a Jira issue | `issue_key`, `body` (ADF, forwarded as-is) | `projects` (parsed from key) | Yes | Yes |
 | `confluence_get_page` | Fetch a Confluence page by ID | `page_id` (numeric page ID), `space` (key for allowlist) | `spaces` | No | No |
-| `confluence_create_page` | Create a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `title`, `body` (storage HTML) | `spaces` | Yes | Yes |
+| `confluence_create_page` | Create a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `title`, `body` (storage HTML), optional `parent_id` (numeric page ID) | `spaces` | Yes | Yes |
 | `confluence_update_page` | Update a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `page_id` (numeric ID), `title`, `version`, `body` (storage HTML) | `spaces` | Yes | Yes |
 | `bitbucket_get_repo` | Fetch a Bitbucket repository | `repo_slug` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_get_pull_request` | Fetch a Bitbucket pull request | `repo_slug`, `pull_request_id` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
@@ -372,6 +372,9 @@ curl -s -X POST http://localhost:8080/mcp \
     }
   }'
 ```
+
+> `parent_id` is optional. When provided, it must be a numeric page ID and is
+> forwarded to the upstream Confluence API as `parentId`.
 
 **Update a Confluence page**
 

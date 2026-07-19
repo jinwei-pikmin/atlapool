@@ -547,6 +547,24 @@ fn resolve_target(
             } else {
                 body
             };
+            let parent_id = args
+                .get("parent_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            if let Some(id) = parent_id {
+                if !id.chars().all(|c| c.is_ascii_digit()) {
+                    return Err("parent_id must be a non-empty numeric id".into());
+                }
+            }
+            let mut payload = json!({
+                "spaceId": space_id,
+                "status": "current",
+                "title": title,
+                "body": body_value
+            });
+            if let Some(id) = parent_id {
+                payload["parentId"] = json!(id);
+            }
             Ok(ToolTarget {
                 workspace: None,
                 repo: None,
@@ -554,12 +572,7 @@ fn resolve_target(
                 space: Some(space),
                 method: Method::POST,
                 path: "/wiki/api/v2/pages".into(),
-                body: RequestBody::json(json!({
-                    "spaceId": space_id,
-                    "status": "current",
-                    "title": title,
-                    "body": body_value
-                })),
+                body: RequestBody::json(payload),
             })
         }
         "confluence_update_page" => {
@@ -1066,6 +1079,7 @@ mod tests {
                 "id": "67890",
                 "title": title,
                 "spaceId": payload["spaceId"],
+                "parentId": payload["parentId"],
                 "body": { "storage": payload["body"] }
             }))
         };
@@ -1928,6 +1942,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_create_page_rejects_invalid_parent_id() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_create_page",
+                json!({
+                    "space": "SPACE",
+                    "space_id": "12345",
+                    "title": "New Page",
+                    "body": "<p>Hello</p>",
+                    "parent_id": "12345/abc"
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_create_page_includes_parent_id_in_body() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            Some(temp_audit_path()),
+            vec!["SPACE".into()],
+        );
+        let audit_path = config.audit.path.clone().unwrap();
+        let audit = Some(AuditLog::new(audit_path));
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_create_page",
+                json!({
+                    "space": "SPACE",
+                    "space_id": "12345",
+                    "title": "Child Page",
+                    "body": "<p>Hello</p>",
+                    "parent_id": "67890"
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["id"], "67890");
+        assert_eq!(json["result"]["parentId"], "67890");
     }
 
     #[tokio::test]
