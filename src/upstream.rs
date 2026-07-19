@@ -30,7 +30,7 @@ impl std::error::Error for UpstreamError {}
 pub struct JiraClient {
     client: Client,
     base_url: String,
-    email: String,
+    email: crate::secrets::SecretString,
     token: crate::secrets::SecretString,
 }
 
@@ -75,10 +75,10 @@ impl JiraClient {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let url = Url::parse(&url).map_err(|_| UpstreamError::InvalidUrl(url.clone()))?;
 
-        let mut builder = self
-            .client
-            .request(method, url)
-            .basic_auth(&self.email, Some(self.token.expose_secret().to_string()));
+        let mut builder = self.client.request(method, url).basic_auth(
+            self.email.expose_secret().to_string(),
+            Some(self.token.expose_secret().to_string()),
+        );
 
         if let Some(body) = body {
             builder = builder.json(&body);
@@ -146,7 +146,7 @@ mod tests {
     fn test_config() -> AtlassianConfig {
         AtlassianConfig {
             base_url: Some("https://example.atlassian.net".into()),
-            email: Some("agent@example.com".into()),
+            email: Some(SecretString::new("agent@example.com")),
             cloud_id: None,
             token: Some(SecretString::new("test-token")),
         }
@@ -155,7 +155,7 @@ mod tests {
     fn cloud_id_config() -> AtlassianConfig {
         AtlassianConfig {
             base_url: None,
-            email: Some("agent@example.com".into()),
+            email: Some(SecretString::new("agent@example.com")),
             cloud_id: Some("test-cloud-id".into()),
             token: Some(SecretString::new("test-token")),
         }
