@@ -583,7 +583,7 @@ mod tests {
             port: 0,
             atlassian: Some(AtlassianConfig {
                 base_url: Some(base_url),
-                email: None,
+
                 cloud_id: None,
                 token: Some(SecretString::new("test-token")),
             }),
@@ -617,7 +617,7 @@ mod tests {
             port: 0,
             atlassian: Some(AtlassianConfig {
                 base_url: Some(base_url),
-                email: None,
+
                 cloud_id: None,
                 token: Some(SecretString::new("test-token")),
             }),

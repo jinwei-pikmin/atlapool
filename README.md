@@ -356,7 +356,6 @@ Examples:
 [atlassian]
 # cloud_id = "12345678-1234-1234-1234-123456789abc"
 # base_url = "https://your-domain.atlassian.net"
-# email = "agent@example.com"                        # optional
 # token = "env:ATLASSIAN_TOKEN"
 # token = "aws:secretsmanager:prod/atlassian/token"
 # token = "gcp:secretmanager:my-project/atlassian-token"
@@ -367,17 +366,23 @@ Examples:
 # token = "env:BITBUCKET_TOKEN"
 ```
 
-### Atlassian credentials
+### Service account permissions
 
-For Service Account scoped tokens you need two values:
+atlapool sends the configured token as `Authorization: Bearer <token>`. You do
+**not** need `email` or Basic Auth; atlapool has never used the `email` field.
+
+#### Atlassian Cloud
+
+You need two values:
 
 1. **Scoped token** — a Service Account token with the required Atlassian OAuth
-   scopes. atlapool sends it as `Authorization: Bearer <token>`.
-   Required scopes:
-   - Jira (OAuth-style): `read:jira-work` and/or `write:jira-work`
-   - Confluence (granular): `read:page:confluence`, `write:page:confluence`,
-     `read:comment:confluence`, `write:comment:confluence`,
-     `read:attachment:confluence`, `write:attachment:confluence`
+   scopes:
+   - Jira (read): `read:jira-work`
+   - Jira (write): `write:jira-work` (only if you enable write tools)
+   - Confluence (read): `read:page:confluence`, `read:comment:confluence`,
+     `read:attachment:confluence`
+   - Confluence (write): `write:page:confluence`, `write:comment:confluence`,
+     `write:attachment:confluence` (only if you enable write tools)
 2. **Cloud ID** — the unique identifier of your Atlassian Cloud site. To find it,
    sign in to your site and open:
 
@@ -394,13 +399,19 @@ For Service Account scoped tokens you need two values:
 
    and `cloudId` looks like `12345678-1234-1234-1234-123456789abc`.
 
-`email` is optional and only useful if you later switch to a classic token with
-Basic Auth. `base_url` is optional and kept for human-readable links or for
-looking up the cloud ID. REST calls are sent through the `api.atlassian.com`
-gateway using `cloud_id`:
+REST calls are sent through the `api.atlassian.com` gateway using `cloud_id`:
 
 - Jira: `https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/...`
 - Confluence: `https://api.atlassian.com/ex/confluence/{cloud_id}/wiki/api/v2/...`
+
+#### Bitbucket Cloud
+
+Create an **App password** or **OAuth consumer** for the workspace and grant at
+least:
+
+- `repository:read` — for `bitbucket_get_repo`
+- `pullrequest:read` — for `bitbucket_get_pull_request`
+- `repository:write` and `pullrequest:write` — if you later enable #39 write tools
 
 Bitbucket calls are sent to `https://api.bitbucket.org/2.0` (or `bitbucket.base_url`
 if overridden):

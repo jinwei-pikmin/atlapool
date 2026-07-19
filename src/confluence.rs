@@ -108,7 +108,7 @@ mod tests {
     fn test_config() -> AtlassianConfig {
         AtlassianConfig {
             base_url: Some("https://example.atlassian.net".into()),
-            email: None,
+
             cloud_id: None,
             token: Some(SecretString::new("test-token")),
         }
@@ -117,7 +117,7 @@ mod tests {
     fn cloud_id_config() -> AtlassianConfig {
         AtlassianConfig {
             base_url: None,
-            email: None,
+
             cloud_id: Some("test-cloud-id".into()),
             token: Some(SecretString::new("test-token")),
         }
