@@ -131,6 +131,94 @@ cargo run
 
 Then use the same `curl` commands as above.
 
+## MCP tools
+
+Call `POST /mcp` with a JSON-RPC 2.0 envelope:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "<tool-name>",
+    "arguments": { ... }
+  }
+}
+```
+
+| Tool | What it does | Required arguments | Allowlist dimension | Write-gate | Audit |
+|---|---|---|---|---|---|
+| `jira_get_issue` | Fetch a Jira issue by key | `issue_key` (e.g. `PROJ-123`) | `projects` (parsed from key) | No | No |
+| `jira_create_issue` | Create a Jira issue | `project`, `summary`, plus any Jira `fields` | `projects` (from `project`) | Yes (`enable_writes = true`) | Yes |
+| `confluence_get_page` | Fetch a Confluence page by ID | `page_id` (numeric page ID), `space` | `spaces` | No | No |
+
+The allowlist is deny-by-default: an agent must list the exact tool name and
+must also match the `project` or `space` dimension. Read tools (`jira_get_issue`,
+`confluence_get_page`) work when `enable_writes` is `false`. The write tool
+(`jira_create_issue`) needs `enable_writes = true` and a writable `audit.path`.
+
+### Examples
+
+**Read a Jira issue**
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "jira_get_issue",
+      "arguments": { "issue_key": "PROJ-123" }
+    }
+  }'
+```
+
+**Create a Jira issue**
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "jira_create_issue",
+      "arguments": {
+        "project": "PROJ",
+        "summary": "Issue summary",
+        "issuetype": { "name": "Story" }
+      }
+    }
+  }'
+```
+
+> For real Jira, `description` and `comment` bodies must be in Atlassian
+> Document Format (ADF). atlapool currently forwards the body as-is, so the
+> caller is responsible for building valid ADF.
+
+**Read a Confluence page**
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "confluence_get_page",
+      "arguments": { "space": "SPACE", "page_id": "12345" }
+    }
+  }'
+```
+
 ## Configuration
 
 See [`config.example.toml`](config.example.toml) for a fully annotated file.
