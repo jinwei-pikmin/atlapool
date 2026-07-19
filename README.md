@@ -160,13 +160,15 @@ Call `POST /mcp` with a JSON-RPC 2.0 envelope:
 | `confluence_update_page` | Update a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `page_id` (numeric ID), `title`, `version`, `body` (storage HTML) | `spaces` | Yes | Yes |
 | `bitbucket_get_repo` | Fetch a Bitbucket repository | `repo_slug` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_get_pull_request` | Fetch a Bitbucket pull request | `repo_slug`, `pull_request_id` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
+| `bitbucket_create_repo` | Create a Bitbucket repository | `repo_slug` (from config `workspace`), optional `is_private` (default `true`) | `bitbucket_workspaces`, `bitbucket_repos` | Yes | Yes |
+| `bitbucket_create_branch` | Create a branch in a repository | `repo_slug`, `branch_name`, `target_hash` | `bitbucket_workspaces`, `bitbucket_repos` | Yes | Yes |
+| `bitbucket_create_commit` | Create a commit by uploading files | `repo_slug`, `message`, `branch`, `files` (map of path → content) | `bitbucket_workspaces`, `bitbucket_repos` | Yes | Yes |
+| `bitbucket_create_pull_request` | Create a pull request | `repo_slug`, `title`, `source_branch`, optional `destination_branch`, `description` | `bitbucket_workspaces`, `bitbucket_repos` | Yes | Yes |
 
 The allowlist is deny-by-default: an agent must list the exact tool name and
 must also match the `project`, `space`, `bitbucket_workspaces`, or `bitbucket_repos`
-dimension. Read tools (`jira_get_issue`, `confluence_get_page`, `bitbucket_get_repo`,
-`bitbucket_get_pull_request`) work when `enable_writes` is `false`. Write tools
-(`jira_create_issue`, `jira_add_comment`, `confluence_create_page`, `confluence_update_page`) need `enable_writes = true` and a
-writable `audit.path`.
+dimension. Read tools work when `enable_writes` is `false`. Write tools need
+`enable_writes = true` and a writable `audit.path`.
 
 ### Examples
 
@@ -333,6 +335,91 @@ curl -s -X POST http://localhost:8080/mcp \
   }'
 ```
 
+**Create a Bitbucket repository**
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "bitbucket_create_repo",
+      "arguments": { "repo_slug": "new-repo" }
+    }
+  }'
+```
+
+Omit `is_private` to default the new repository to private.
+
+**Create a Bitbucket branch**
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "bitbucket_create_branch",
+      "arguments": {
+        "repo_slug": "my-repo",
+        "branch_name": "feature/x",
+        "target_hash": "abc123"
+      }
+    }
+  }'
+```
+
+**Create a Bitbucket commit**
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "bitbucket_create_commit",
+      "arguments": {
+        "repo_slug": "my-repo",
+        "message": "Add README",
+        "branch": "main",
+        "files": { "README.md": "Hello world" }
+      }
+    }
+  }'
+```
+
+**Create a Bitbucket pull request**
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "bitbucket_create_pull_request",
+      "arguments": {
+        "repo_slug": "my-repo",
+        "title": "Feature X",
+        "source_branch": "feature/x",
+        "destination_branch": "main",
+        "description": "Adds feature X"
+      }
+    }
+  }'
+```
+
 The workspace for Bitbucket calls comes from `[bitbucket].workspace` in
 `config.toml`, not from the caller.
 
@@ -415,13 +502,18 @@ least:
 
 - `repository:read` — for `bitbucket_get_repo`
 - `pullrequest:read` — for `bitbucket_get_pull_request`
-- `repository:write` and `pullrequest:write` — if you later enable #39 write tools
+- `repository:write` — for `bitbucket_create_branch`, `bitbucket_create_commit`
+- `repository:admin` — for `bitbucket_create_repo` (Bitbucket's API requires admin scope to create repositories; this is different from `repository:write`)
+- `pullrequest:write` — for `bitbucket_create_pull_request`
 
 Bitbucket calls are sent to `https://api.bitbucket.org/2.0` (or `bitbucket.base_url`
 if overridden):
 
 - Repository: `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}`
 - Pull request: `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/pullrequests/{pull_request_id}`
+- Branches: `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/refs/branches`
+- Source (commit): `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/src`
+- Pull requests: `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/pullrequests`
 
 ### Agent allowlists
 
@@ -431,19 +523,19 @@ if overridden):
 - `spaces`: Confluence space keys allowed. Same glob semantics.
 - `bitbucket_workspaces`: Bitbucket workspace slugs allowed. Same glob semantics.
 - `bitbucket_repos`: Bitbucket repository slugs allowed. Same glob semantics.
-- `enable_writes`: must be `true` for any write tool (`jira_create_issue`,
-  `jira_add_comment`, `confluence_create_page`, `confluence_update_page`).
+- `enable_writes`: must be `true` for any write tool.
 
 ### Read vs. write and audit
 
-`jira_get_issue`, `confluence_get_page`, `bitbucket_get_repo`, and
-`bitbucket_get_pull_request` are read tools. They pass through the allowlist and
-do not touch the audit log.
+Read tools (`jira_get_issue`, `confluence_get_page`, `bitbucket_get_repo`,
+`bitbucket_get_pull_request`) pass through the allowlist and do not touch the
+audit log.
 
-`jira_create_issue`, `jira_add_comment`, `confluence_create_page`, and
-`confluence_update_page` are write tools. They require `enable_writes = true` and
-a configured `audit.path`. If audit logging fails, the request is rejected before
-the upstream call.
+Write tools (`jira_create_issue`, `jira_add_comment`, `confluence_create_page`,
+`confluence_update_page`, `bitbucket_create_repo`, `bitbucket_create_branch`,
+`bitbucket_create_commit`, `bitbucket_create_pull_request`) require
+`enable_writes = true` and a configured `audit.path`. If audit logging fails, the
+request is rejected before the upstream call.
 
 ## Testing with a mock upstream
 

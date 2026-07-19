@@ -1,8 +1,7 @@
 use crate::config::BitbucketConfig;
-use crate::upstream::UpstreamClient;
-use crate::upstream::UpstreamError;
+use crate::upstream::{RequestBody, UpstreamClient, UpstreamError};
 use reqwest::{header, Client, Method, Url};
-use serde_json::Value;
+use serde_json::json;
 
 /// Bitbucket Cloud REST client. Caller headers are **not** trusted; every
 /// request starts from an empty header set and receives the server-injected
@@ -48,7 +47,7 @@ impl BitbucketClient {
         &self,
         method: Method,
         path: &str,
-        body: Option<Value>,
+        body: RequestBody,
     ) -> Result<reqwest::Request, UpstreamError> {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let url = Url::parse(&url).map_err(|_| UpstreamError::InvalidUrl(url.clone()))?;
@@ -58,8 +57,10 @@ impl BitbucketClient {
             format!("Bearer {}", self.token.expose_secret()),
         );
 
-        if let Some(body) = body {
-            builder = builder.json(&body);
+        match body {
+            RequestBody::None => {}
+            RequestBody::Json(v) => builder = builder.json(&v),
+            RequestBody::Form(fields) => builder = builder.form(&fields),
         }
 
         builder.build().map_err(UpstreamError::RequestBuild)
@@ -77,7 +78,7 @@ impl BitbucketClient {
         self.request(
             Method::GET,
             &format!("/repositories/{}/{repo_slug}", self.workspace),
-            None,
+            RequestBody::None,
         )
     }
 
@@ -93,7 +94,88 @@ impl BitbucketClient {
                 "/repositories/{}/{repo_slug}/pullrequests/{pull_request_id}",
                 self.workspace
             ),
-            None,
+            RequestBody::None,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn create_branch_request(
+        &self,
+        repo_slug: &str,
+        branch_name: &str,
+        target_hash: &str,
+    ) -> Result<reqwest::Request, UpstreamError> {
+        self.request(
+            Method::POST,
+            &format!("/repositories/{}/{repo_slug}/refs/branches", self.workspace),
+            RequestBody::json(json!({
+                "name": branch_name,
+                "target": { "hash": target_hash }
+            })),
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn create_commit_request(
+        &self,
+        repo_slug: &str,
+        message: &str,
+        branch: &str,
+        parents: &[String],
+        files: &[(String, String)],
+    ) -> Result<reqwest::Request, UpstreamError> {
+        let mut fields: Vec<(String, String)> = Vec::new();
+        fields.push(("message".into(), message.into()));
+        fields.push(("branch".into(), branch.into()));
+        for parent in parents {
+            fields.push(("parents".into(), parent.clone()));
+        }
+        for (path, content) in files {
+            fields.push((path.clone(), content.clone()));
+        }
+        self.request(
+            Method::POST,
+            &format!("/repositories/{}/{repo_slug}/src", self.workspace),
+            RequestBody::form(fields),
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn create_pull_request_request(
+        &self,
+        repo_slug: &str,
+        title: &str,
+        source_branch: &str,
+        destination_branch: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<reqwest::Request, UpstreamError> {
+        let mut body = json!({
+            "title": title,
+            "source": { "branch": { "name": source_branch } }
+        });
+        if let Some(destination) = destination_branch {
+            body["destination"] = json!({ "branch": { "name": destination } });
+        }
+        if let Some(description) = description {
+            body["description"] = json!(description);
+        }
+        self.request(
+            Method::POST,
+            &format!("/repositories/{}/{repo_slug}/pullrequests", self.workspace),
+            RequestBody::json(body),
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn create_repo_request(
+        &self,
+        repo_slug: &str,
+        is_private: bool,
+    ) -> Result<reqwest::Request, UpstreamError> {
+        self.request(
+            Method::POST,
+            &format!("/repositories/{}/{repo_slug}", self.workspace),
+            RequestBody::json(json!({ "is_private": is_private })),
         )
     }
 }
@@ -103,7 +185,7 @@ impl UpstreamClient for BitbucketClient {
         &self,
         method: Method,
         path: &str,
-        body: Option<Value>,
+        body: RequestBody,
     ) -> Result<reqwest::Request, UpstreamError> {
         self.request(method, path, body)
     }
@@ -189,5 +271,76 @@ mod tests {
             token: None,
         };
         assert!(BitbucketClient::new(&config).is_err());
+    }
+
+    #[test]
+    fn create_branch_request_builds_correct_path_and_body() {
+        let client = BitbucketClient::new(&test_config()).unwrap();
+        let request = client
+            .create_branch_request("my-repo", "feature/new", "abc123")
+            .unwrap();
+
+        assert_eq!(request.method(), Method::POST);
+        assert_eq!(
+            request.url().path(),
+            "/repositories/WORK/my-repo/refs/branches"
+        );
+        assert_eq!(
+            request.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn create_commit_request_builds_correct_form_body() {
+        let client = BitbucketClient::new(&test_config()).unwrap();
+        let request = client
+            .create_commit_request(
+                "my-repo",
+                "commit msg",
+                "main",
+                &["parent1".into()],
+                &[("README.md".into(), "hello".into())],
+            )
+            .unwrap();
+
+        assert_eq!(request.method(), Method::POST);
+        assert_eq!(request.url().path(), "/repositories/WORK/my-repo/src");
+        assert!(request
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("application/x-www-form-urlencoded"));
+    }
+
+    #[test]
+    fn create_pull_request_request_builds_correct_path_and_body() {
+        let client = BitbucketClient::new(&test_config()).unwrap();
+        let request = client
+            .create_pull_request_request(
+                "my-repo",
+                "PR title",
+                "feature/src",
+                Some("main"),
+                Some("desc"),
+            )
+            .unwrap();
+
+        assert_eq!(request.method(), Method::POST);
+        assert_eq!(
+            request.url().path(),
+            "/repositories/WORK/my-repo/pullrequests"
+        );
+    }
+
+    #[test]
+    fn create_repo_request_defaults_to_private() {
+        let client = BitbucketClient::new(&test_config()).unwrap();
+        let request = client.create_repo_request("new-repo", true).unwrap();
+
+        assert_eq!(request.method(), Method::POST);
+        assert_eq!(request.url().path(), "/repositories/WORK/new-repo");
     }
 }
