@@ -9,6 +9,7 @@ pub struct Config {
     #[serde(default = "default_port")]
     pub port: u16,
     pub atlassian: Option<AtlassianConfig>,
+    pub bitbucket: Option<BitbucketConfig>,
     #[serde(default)]
     pub mcp: McpConfig,
     #[serde(default)]
@@ -22,6 +23,7 @@ impl Default for Config {
         Self {
             port: default_port(),
             atlassian: None,
+            bitbucket: None,
             mcp: McpConfig::default(),
             audit: AuditConfig::default(),
             agents: Vec::new(),
@@ -35,6 +37,14 @@ pub struct AtlassianConfig {
     pub base_url: Option<String>,
     pub email: Option<crate::secrets::SecretString>,
     pub cloud_id: Option<String>,
+    pub token: Option<crate::secrets::SecretString>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[allow(dead_code)]
+pub struct BitbucketConfig {
+    pub base_url: Option<String>,
+    pub workspace: Option<String>,
     pub token: Option<crate::secrets::SecretString>,
 }
 
@@ -107,6 +117,15 @@ impl Config {
                 if crate::secrets::is_secret_reference(s) {
                     let resolved = crate::secrets::resolve(backend, s).await?;
                     atlassian.token = Some(crate::secrets::SecretString::new(resolved));
+                }
+            }
+        }
+        if let Some(ref mut bitbucket) = config.bitbucket {
+            if let Some(token) = bitbucket.token.as_ref() {
+                let s = token.expose_secret();
+                if crate::secrets::is_secret_reference(s) {
+                    let resolved = crate::secrets::resolve(backend, s).await?;
+                    bitbucket.token = Some(crate::secrets::SecretString::new(resolved));
                 }
             }
         }

@@ -13,6 +13,10 @@ pub struct AgentConfig {
     #[serde(default)]
     pub spaces: Vec<String>,
     #[serde(default)]
+    pub bitbucket_workspaces: Vec<String>,
+    #[serde(default)]
+    pub bitbucket_repos: Vec<String>,
+    #[serde(default)]
     pub enable_writes: bool,
 }
 
@@ -40,25 +44,44 @@ pub fn classify_tool(tool: &str) -> ToolKind {
 }
 
 impl AgentConfig {
-    /// Authorize a single call by checking tool and project/space allowlists.
+    /// Authorize a single call by checking tool and all provided allowlist dimensions.
     ///
     /// Policy:
     /// - Tool must be in `tools`.
-    /// - `project` and/or `space` must be resolvable (non-empty).
-    /// - At least one resolved value must match the corresponding allowlist.
-    /// - If both are resolvable but neither matches, deny.
-    pub fn authorize(&self, tool: &str, project: Option<&str>, space: Option<&str>) -> bool {
+    /// - Any provided non-empty dimension (`project`, `space`, `workspace`, `repo`)
+    ///   must match the corresponding allowlist. All provided dimensions must pass.
+    /// - If no dimension is provided, deny.
+    pub fn authorize(
+        &self,
+        tool: &str,
+        project: Option<&str>,
+        space: Option<&str>,
+        workspace: Option<&str>,
+        repo: Option<&str>,
+    ) -> bool {
         if !self.tools.iter().any(|t| t == tool) {
             return false;
         }
 
         let project = project.filter(|p| !p.is_empty());
         let space = space.filter(|s| !s.is_empty());
+        let workspace = workspace.filter(|w| !w.is_empty());
+        let repo = repo.filter(|r| !r.is_empty());
 
-        let project_ok = project.is_some_and(|p| allowlist_match(&self.projects, p));
-        let space_ok = space.is_some_and(|s| allowlist_match(&self.spaces, s));
+        if project.is_none() && space.is_none() && workspace.is_none() && repo.is_none() {
+            return false;
+        }
 
-        if !project_ok && !space_ok {
+        if project.is_some_and(|p| !allowlist_match(&self.projects, p)) {
+            return false;
+        }
+        if space.is_some_and(|s| !allowlist_match(&self.spaces, s)) {
+            return false;
+        }
+        if workspace.is_some_and(|w| !allowlist_match(&self.bitbucket_workspaces, w)) {
+            return false;
+        }
+        if repo.is_some_and(|r| !allowlist_match(&self.bitbucket_repos, r)) {
             return false;
         }
 
@@ -137,6 +160,8 @@ mod tests {
             tools: vec!["jira_search_issues".into(), "confluence_read_page".into()],
             projects: vec!["PROJ".into(), "PROJ/*".into()],
             spaces: vec!["SPACE".into(), "SPACE/*".into()],
+            bitbucket_workspaces: vec!["WORK".into(), "WORK/*".into()],
+            bitbucket_repos: vec!["REPO".into(), "REPO/*".into()],
             enable_writes: false,
         }
     }
@@ -158,45 +183,45 @@ mod tests {
     #[test]
     fn authorize_tool_allowed() {
         let agent = demo_agent();
-        assert!(agent.authorize("jira_search_issues", Some("PROJ"), None));
+        assert!(agent.authorize("jira_search_issues", Some("PROJ"), None, None, None));
     }
 
     #[test]
     fn authorize_tool_denied() {
         let agent = demo_agent();
-        assert!(!agent.authorize("jira_delete_issue", Some("PROJ"), None));
+        assert!(!agent.authorize("jira_delete_issue", Some("PROJ"), None, None, None));
     }
 
     #[test]
     fn authorize_project_allowed() {
         let agent = demo_agent();
-        assert!(agent.authorize("jira_search_issues", Some("PROJ"), None));
+        assert!(agent.authorize("jira_search_issues", Some("PROJ"), None, None, None));
     }
 
     #[test]
     fn authorize_project_denied() {
         let agent = demo_agent();
-        assert!(!agent.authorize("jira_search_issues", Some("OTHER"), None));
+        assert!(!agent.authorize("jira_search_issues", Some("OTHER"), None, None, None));
     }
 
     #[test]
     fn authorize_project_wildcard() {
         let agent = demo_agent();
-        assert!(agent.authorize("jira_search_issues", Some("PROJ/123"), None));
-        assert!(!agent.authorize("jira_search_issues", Some("OTHER/123"), None));
+        assert!(agent.authorize("jira_search_issues", Some("PROJ/123"), None, None, None));
+        assert!(!agent.authorize("jira_search_issues", Some("OTHER/123"), None, None, None));
     }
 
     #[test]
     fn authorize_space_wildcard() {
         let agent = demo_agent();
-        assert!(agent.authorize("confluence_read_page", None, Some("SPACE/HOME")));
-        assert!(!agent.authorize("confluence_read_page", None, Some("OTHER/HOME")));
+        assert!(agent.authorize("confluence_read_page", None, Some("SPACE/HOME"), None, None));
+        assert!(!agent.authorize("confluence_read_page", None, Some("OTHER/HOME"), None, None));
     }
 
     #[test]
     fn authorize_unresolvable_project_and_space() {
         let agent = demo_agent();
-        assert!(!agent.authorize("jira_search_issues", None, None));
+        assert!(!agent.authorize("jira_search_issues", None, None, None, None));
     }
 
     #[test]
@@ -207,16 +232,60 @@ mod tests {
             tools: vec!["cross_tool".into()],
             projects: vec!["PROJ".into()],
             spaces: vec![],
+            bitbucket_workspaces: vec![],
+            bitbucket_repos: vec![],
             enable_writes: false,
         };
         // Project resolves and matches, even though space is unresolved.
-        assert!(agent.authorize("cross_tool", Some("PROJ"), None));
+        assert!(agent.authorize("cross_tool", Some("PROJ"), None, None, None));
+    }
+
+    #[test]
+    fn authorize_bitbucket_workspace_and_repo_allowed() {
+        let agent = AgentConfig {
+            id: "bb".into(),
+            keys: vec![],
+            tools: vec!["bitbucket_get_repo".into()],
+            projects: vec![],
+            spaces: vec![],
+            bitbucket_workspaces: vec!["WORK".into()],
+            bitbucket_repos: vec!["REPO".into()],
+            enable_writes: false,
+        };
+        assert!(agent.authorize("bitbucket_get_repo", None, None, Some("WORK"), Some("REPO")));
+    }
+
+    #[test]
+    fn authorize_bitbucket_repo_denied() {
+        let agent = AgentConfig {
+            id: "bb".into(),
+            keys: vec![],
+            tools: vec!["bitbucket_get_repo".into()],
+            projects: vec![],
+            spaces: vec![],
+            bitbucket_workspaces: vec!["WORK".into()],
+            bitbucket_repos: vec!["REPO".into()],
+            enable_writes: false,
+        };
+        assert!(!agent.authorize(
+            "bitbucket_get_repo",
+            None,
+            None,
+            Some("WORK"),
+            Some("OTHER")
+        ));
     }
 
     #[test]
     fn authorize_deny_when_both_resolved_but_unlisted() {
         let agent = demo_agent();
-        assert!(!agent.authorize("jira_search_issues", Some("OTHER"), Some("OTHER")));
+        assert!(!agent.authorize(
+            "jira_search_issues",
+            Some("OTHER"),
+            Some("OTHER"),
+            None,
+            None
+        ));
     }
 
     #[test]

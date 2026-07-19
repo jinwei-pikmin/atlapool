@@ -158,10 +158,13 @@ Call `POST /mcp` with a JSON-RPC 2.0 envelope:
 | `confluence_get_page` | Fetch a Confluence page by ID | `page_id` (numeric page ID), `space` (key for allowlist) | `spaces` | No | No |
 | `confluence_create_page` | Create a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `title`, `body` (storage HTML) | `spaces` | Yes | Yes |
 | `confluence_update_page` | Update a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `page_id` (numeric ID), `title`, `version`, `body` (storage HTML) | `spaces` | Yes | Yes |
+| `bitbucket_get_repo` | Fetch a Bitbucket repository | `repo_slug` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
+| `bitbucket_get_pull_request` | Fetch a Bitbucket pull request | `repo_slug`, `pull_request_id` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 
 The allowlist is deny-by-default: an agent must list the exact tool name and
-must also match the `project` or `space` dimension. Read tools (`jira_get_issue`,
-`confluence_get_page`) work when `enable_writes` is `false`. Write tools
+must also match the `project`, `space`, `bitbucket_workspaces`, or `bitbucket_repos`
+dimension. Read tools (`jira_get_issue`, `confluence_get_page`, `bitbucket_get_repo`,
+`bitbucket_get_pull_request`) work when `enable_writes` is `false`. Write tools
 (`jira_create_issue`, `jira_add_comment`, `confluence_create_page`, `confluence_update_page`) need `enable_writes = true` and a
 writable `audit.path`.
 
@@ -296,13 +299,50 @@ For `confluence_create_page` and `confluence_update_page`, the `body` argument
 can also be a full JSON object with `representation` and `value` if the caller
 wants full control over the body format.
 
+**Read a Bitbucket repository**
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "bitbucket_get_repo",
+      "arguments": { "repo_slug": "my-repo" }
+    }
+  }'
+```
+
+**Read a Bitbucket pull request**
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "bitbucket_get_pull_request",
+      "arguments": { "repo_slug": "my-repo", "pull_request_id": "42" }
+    }
+  }'
+```
+
+The workspace for Bitbucket calls comes from `[bitbucket].workspace` in
+`config.toml`, not from the caller.
+
 ## Configuration
 
 See [`config.example.toml`](config.example.toml) for a fully annotated file.
 
 ### Secret reference formats
 
-`atlassian.token` and each `keys` entry can be any of:
+`atlassian.token`, `bitbucket.token` and each `keys` entry can be any of:
 
 - `env:VAR_NAME` — local environment variable.
 - `aws:secretsmanager:<secret-id>` — AWS Secrets Manager plain-string secret.
@@ -320,6 +360,11 @@ Examples:
 # token = "env:ATLASSIAN_TOKEN"
 # token = "aws:secretsmanager:prod/atlassian/token"
 # token = "gcp:secretmanager:my-project/atlassian-token"
+
+[bitbucket]
+# workspace = "my-workspace"
+# base_url = "https://api.bitbucket.org/2.0"
+# token = "env:BITBUCKET_TOKEN"
 ```
 
 ### Atlassian credentials
@@ -357,22 +402,32 @@ gateway using `cloud_id`:
 - Jira: `https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/...`
 - Confluence: `https://api.atlassian.com/ex/confluence/{cloud_id}/wiki/api/v2/...`
 
+Bitbucket calls are sent to `https://api.bitbucket.org/2.0` (or `bitbucket.base_url`
+if overridden):
+
+- Repository: `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}`
+- Pull request: `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/pullrequests/{pull_request_id}`
+
 ### Agent allowlists
 
 - `tools`: exact MCP tool names the agent may call.
 - `projects`: Jira project keys allowed. Supports glob `*` (matches any sequence,
   including `/`).
 - `spaces`: Confluence space keys allowed. Same glob semantics.
+- `bitbucket_workspaces`: Bitbucket workspace slugs allowed. Same glob semantics.
+- `bitbucket_repos`: Bitbucket repository slugs allowed. Same glob semantics.
 - `enable_writes`: must be `true` for any write tool (`jira_create_issue`,
   `jira_add_comment`, `confluence_create_page`, `confluence_update_page`).
 
 ### Read vs. write and audit
 
-`jira_get_issue` and `confluence_get_page` are read tools. They pass through the
-allowlist and do not touch the audit log.
+`jira_get_issue`, `confluence_get_page`, `bitbucket_get_repo`, and
+`bitbucket_get_pull_request` are read tools. They pass through the allowlist and
+do not touch the audit log.
 
-`jira_create_issue`, `jira_add_comment`, `confluence_create_page`, and `confluence_update_page` are write tools. They require `enable_writes = true` and a
-configured `audit.path`. If audit logging fails, the request is rejected before
+`jira_create_issue`, `jira_add_comment`, `confluence_create_page`, and
+`confluence_update_page` are write tools. They require `enable_writes = true` and
+a configured `audit.path`. If audit logging fails, the request is rejected before
 the upstream call.
 
 ## Testing with a mock upstream
@@ -410,11 +465,11 @@ Run it in one terminal, set `base_url = "http://127.0.0.1:9001"` in
 |---|---|---|
 | `missing or empty X-Atlapool-Key` | Request lacks the `X-Atlapool-Key` header. | Add `-H "X-Atlapool-Key: your-key"`. |
 | `unknown key` | The key is not in any `agents.keys` list. | Check `config.toml` keys and secret resolution. |
-| `not permitted by agent policy` | Tool, project, or space is not allowed. | Verify `tools`, `projects`, and `spaces` arrays for the agent. |
+| `not permitted by agent policy` | Tool, project, space, or Bitbucket workspace/repo is not allowed. | Verify `tools`, `projects`, `spaces`, `bitbucket_workspaces`, and `bitbucket_repos` arrays for the agent. |
 | `write tools not enabled for agent` | Calling a write tool without `enable_writes = true`. | Set `enable_writes = true` for that agent. |
 | `audit log not configured` / `audit log write failed` | The audit log path is missing or unwritable. | Set `audit.path` or ensure the directory exists. |
-| `upstream not configured` / `confluence upstream not configured` | `[atlassian]` section is missing or `base_url`/`token` are empty. | Fill in `token` and `cloud_id` (or `base_url` as fallback). |
-| `unsupported tool` | The tool name is not implemented or not in the agent `tools` list. | Use `jira_get_issue`, `jira_create_issue`, `jira_add_comment`, `confluence_get_page`, `confluence_create_page`, or `confluence_update_page`. |
+| `upstream not configured` / `confluence upstream not configured` / `bitbucket upstream not configured` | The corresponding upstream section is missing or required fields are empty. | Fill in `token` and `cloud_id` / `base_url` (or `workspace` for Bitbucket). |
+| `unsupported tool` | The tool name is not implemented or not in the agent `tools` list. | Use a supported tool name. |
 | Jira returns 401 or 403 | The Atlassian token is invalid or lacks permissions. | Regenerate `ATLASSIAN_TOKEN` and check project access. |
 
 ## License

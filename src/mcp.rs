@@ -34,6 +34,8 @@ struct McpToolParams {
 struct ToolTarget {
     project: Option<String>,
     space: Option<String>,
+    workspace: Option<String>,
+    repo: Option<String>,
     method: Method,
     path: String,
     body: Option<Value>,
@@ -104,7 +106,12 @@ pub async fn mcp_handler(
 
     // Unknown or unsupported tools are rejected explicitly before allowlist or
     // write-gate checks, so those layers do not have to reason about empty targets.
-    let target = match resolve_target(&params.name, params.arguments.as_ref()) {
+    let workspace = state
+        .config
+        .bitbucket
+        .as_ref()
+        .and_then(|c| c.workspace.as_deref());
+    let target = match resolve_target(&params.name, params.arguments.as_ref(), workspace) {
         Ok(t) => t,
         Err(msg) => return mcp_error(request.id, StatusCode::BAD_REQUEST, &msg),
     };
@@ -113,6 +120,8 @@ pub async fn mcp_handler(
         &params.name,
         target.project.as_deref(),
         target.space.as_deref(),
+        target.workspace.as_deref(),
+        target.repo.as_deref(),
     ) {
         tracing::warn!(
             agent_id = %agent.id,
@@ -195,6 +204,15 @@ pub async fn mcp_handler(
             );
         };
         forward(confluence, request.id.clone(), target).await
+    } else if params.name.starts_with("bitbucket_") {
+        let Some(bitbucket) = state.bitbucket.as_ref() else {
+            return mcp_error(
+                request.id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bitbucket upstream not configured",
+            );
+        };
+        forward(bitbucket, request.id.clone(), target).await
     } else {
         let Some(jira) = state.jira.as_ref() else {
             return mcp_error(
@@ -268,7 +286,24 @@ fn mcp_error(id: Option<Value>, status: StatusCode, message: &str) -> (StatusCod
     (status, Json(body))
 }
 
-fn resolve_target(tool: &str, args: Option<&Value>) -> Result<ToolTarget, String> {
+fn resolve_target(
+    tool: &str,
+    args: Option<&Value>,
+    workspace: Option<&str>,
+) -> Result<ToolTarget, String> {
+    let valid_repo_slug = |s: &str| -> Result<(), String> {
+        if s.is_empty() {
+            return Err("repo_slug must not be empty".into());
+        }
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+        {
+            return Err("repo_slug contains invalid characters".into());
+        }
+        Ok(())
+    };
+
     match tool {
         "jira_get_issue" => {
             let args = args.ok_or("missing arguments")?;
@@ -278,6 +313,8 @@ fn resolve_target(tool: &str, args: Option<&Value>) -> Result<ToolTarget, String
                 .ok_or("missing issue_key")?;
             let project = issue_key.split_once('-').map(|(p, _)| p.to_string());
             Ok(ToolTarget {
+                workspace: None,
+                repo: None,
                 project,
                 space: None,
                 method: Method::GET,
@@ -293,6 +330,8 @@ fn resolve_target(tool: &str, args: Option<&Value>) -> Result<ToolTarget, String
                 .ok_or("missing project")?
                 .to_string();
             Ok(ToolTarget {
+                workspace: None,
+                repo: None,
                 project: Some(project),
                 space: None,
                 method: Method::POST,
@@ -309,6 +348,8 @@ fn resolve_target(tool: &str, args: Option<&Value>) -> Result<ToolTarget, String
             let project = issue_key.split_once('-').map(|(p, _)| p.to_string());
             let body = args.get("body").cloned().ok_or("missing body")?;
             Ok(ToolTarget {
+                workspace: None,
+                repo: None,
                 project,
                 space: None,
                 method: Method::POST,
@@ -334,6 +375,8 @@ fn resolve_target(tool: &str, args: Option<&Value>) -> Result<ToolTarget, String
                 return Err("page_id must be a non-empty numeric id".into());
             }
             Ok(ToolTarget {
+                workspace: None,
+                repo: None,
                 project: None,
                 space: Some(space),
                 method: Method::GET,
@@ -374,6 +417,8 @@ fn resolve_target(tool: &str, args: Option<&Value>) -> Result<ToolTarget, String
                 body
             };
             Ok(ToolTarget {
+                workspace: None,
+                repo: None,
                 project: None,
                 space: Some(space),
                 method: Method::POST,
@@ -437,6 +482,8 @@ fn resolve_target(tool: &str, args: Option<&Value>) -> Result<ToolTarget, String
                 body
             };
             Ok(ToolTarget {
+                workspace: None,
+                repo: None,
                 project: None,
                 space: Some(space),
                 method: Method::PUT,
@@ -451,6 +498,51 @@ fn resolve_target(tool: &str, args: Option<&Value>) -> Result<ToolTarget, String
                 })),
             })
         }
+        "bitbucket_get_repo" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::GET,
+                path: format!("/repositories/{workspace}/{repo_slug}"),
+                body: None,
+            })
+        }
+        "bitbucket_get_pull_request" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let pull_request_id = args
+                .get("pull_request_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing pull_request_id")?;
+            if pull_request_id.is_empty() || !pull_request_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err("pull_request_id must be a non-empty numeric id".into());
+            }
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::GET,
+                path: format!(
+                    "/repositories/{workspace}/{repo_slug}/pullrequests/{pull_request_id}"
+                ),
+                body: None,
+            })
+        }
         _ => Err("unsupported tool".into()),
     }
 }
@@ -460,7 +552,8 @@ mod tests {
     use super::*;
     use crate::agents::AgentConfig;
     use crate::audit::AuditLog;
-    use crate::config::{AtlassianConfig, AuditConfig, Config, McpConfig};
+    use crate::bitbucket::BitbucketClient;
+    use crate::config::{AtlassianConfig, AuditConfig, BitbucketConfig, Config, McpConfig};
     use crate::confluence::ConfluenceClient;
     use crate::secrets::SecretString;
     use crate::upstream::JiraClient;
@@ -494,6 +587,7 @@ mod tests {
                 cloud_id: None,
                 token: Some(SecretString::new("test-token")),
             }),
+            bitbucket: None,
             mcp: McpConfig::default(),
             audit: AuditConfig { path: audit_path },
             agents: vec![AgentConfig {
@@ -506,6 +600,8 @@ mod tests {
                 ],
                 projects: vec!["PROJ".into()],
                 spaces: vec![],
+                bitbucket_workspaces: vec![],
+                bitbucket_repos: vec![],
                 enable_writes,
             }],
         }
@@ -525,6 +621,7 @@ mod tests {
                 cloud_id: None,
                 token: Some(SecretString::new("test-token")),
             }),
+            bitbucket: None,
             mcp: McpConfig::default(),
             audit: AuditConfig { path: audit_path },
             agents: vec![AgentConfig {
@@ -537,7 +634,41 @@ mod tests {
                 ],
                 projects: vec![],
                 spaces,
+                bitbucket_workspaces: vec![],
+                bitbucket_repos: vec![],
                 enable_writes,
+            }],
+        }
+    }
+
+    fn bitbucket_test_config(
+        base_url: String,
+        audit_path: Option<String>,
+        workspaces: Vec<String>,
+        repos: Vec<String>,
+    ) -> Config {
+        Config {
+            port: 0,
+            atlassian: None,
+            bitbucket: Some(BitbucketConfig {
+                base_url: Some(base_url),
+                workspace: Some("WORK".into()),
+                token: Some(SecretString::new("test-token")),
+            }),
+            mcp: McpConfig::default(),
+            audit: AuditConfig { path: audit_path },
+            agents: vec![AgentConfig {
+                id: "demo".into(),
+                keys: vec![SecretString::new("agent-key")],
+                tools: vec![
+                    "bitbucket_get_repo".into(),
+                    "bitbucket_get_pull_request".into(),
+                ],
+                projects: vec![],
+                spaces: vec![],
+                bitbucket_workspaces: workspaces,
+                bitbucket_repos: repos,
+                enable_writes: false,
             }],
         }
     }
@@ -692,6 +823,7 @@ mod tests {
             config: test_config("http://localhost:0".into(), false, None),
             jira: None,
             confluence: None,
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -713,6 +845,7 @@ mod tests {
             config: test_config("http://localhost:0".into(), false, None),
             jira: None,
             confluence: None,
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -737,6 +870,7 @@ mod tests {
             config,
             jira: Some(jira),
             confluence: None,
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -761,6 +895,7 @@ mod tests {
             config,
             jira: Some(jira),
             confluence: None,
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -803,6 +938,7 @@ mod tests {
             config,
             jira: Some(jira),
             confluence: None,
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -827,6 +963,7 @@ mod tests {
             config,
             jira: Some(jira),
             confluence: None,
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -857,6 +994,7 @@ mod tests {
             config,
             jira: Some(jira),
             confluence: None,
+            bitbucket: None,
             audit,
         };
         let app = crate::router(state);
@@ -902,6 +1040,7 @@ mod tests {
             config,
             jira: Some(jira),
             confluence: None,
+            bitbucket: None,
             audit,
         };
         let app = crate::router(state);
@@ -956,6 +1095,7 @@ mod tests {
             config,
             jira: Some(jira),
             confluence: None,
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -983,6 +1123,7 @@ mod tests {
             config,
             jira: Some(jira),
             confluence: None,
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -1010,6 +1151,7 @@ mod tests {
             config,
             jira: Some(jira),
             confluence: None,
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -1050,6 +1192,7 @@ mod tests {
             config,
             jira: Some(jira),
             confluence: None,
+            bitbucket: None,
             audit,
         };
         let app = crate::router(state);
@@ -1076,6 +1219,7 @@ mod tests {
             config,
             jira: Some(jira),
             confluence: None,
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -1105,6 +1249,7 @@ mod tests {
             config,
             jira: None,
             confluence: Some(confluence),
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -1152,6 +1297,7 @@ mod tests {
             config,
             jira: None,
             confluence: Some(confluence),
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -1180,6 +1326,7 @@ mod tests {
             config,
             jira: None,
             confluence: None,
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -1210,6 +1357,7 @@ mod tests {
             config,
             jira: None,
             confluence: Some(confluence),
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -1242,6 +1390,7 @@ mod tests {
             config,
             jira: None,
             confluence: Some(confluence),
+            bitbucket: None,
             audit,
         };
         let app = crate::router(state);
@@ -1304,6 +1453,7 @@ mod tests {
             config,
             jira: None,
             confluence: Some(confluence),
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -1338,6 +1488,7 @@ mod tests {
             config,
             jira: None,
             confluence: Some(confluence),
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -1372,6 +1523,7 @@ mod tests {
             config,
             jira: None,
             confluence: Some(confluence),
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -1407,6 +1559,7 @@ mod tests {
             config,
             jira: None,
             confluence: Some(confluence),
+            bitbucket: None,
             audit,
         };
         let app = crate::router(state);
@@ -1471,6 +1624,7 @@ mod tests {
             config,
             jira: None,
             confluence: Some(confluence),
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -1507,6 +1661,7 @@ mod tests {
             config,
             jira: None,
             confluence: Some(confluence),
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -1543,6 +1698,7 @@ mod tests {
             config,
             jira: None,
             confluence: Some(confluence),
+            bitbucket: None,
             audit: None,
         };
         let app = crate::router(state);
@@ -1556,6 +1712,299 @@ mod tests {
                     "title": "Updated Page",
                     "body": "<p>Updated</p>"
                 }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    async fn mock_bitbucket_server() -> (u16, Arc<Mutex<Vec<HeaderMap>>>) {
+        #[derive(Clone)]
+        struct MockState {
+            headers: Arc<Mutex<Vec<HeaderMap>>>,
+        }
+
+        let state = MockState {
+            headers: Arc::new(Mutex::new(Vec::new())),
+        };
+        let captured = state.headers.clone();
+
+        let repo_handler = |State(s): State<MockState>,
+                            Path((workspace, repo)): Path<(String, String)>,
+                            headers: HeaderMap| async move {
+            s.headers.lock().unwrap().push(headers);
+            Json(json!({
+                "full_name": format!("{workspace}/{repo}"),
+                "name": repo,
+                "workspace": { "slug": workspace }
+            }))
+        };
+
+        let pr_handler = |State(s): State<MockState>,
+                          Path((workspace, repo, pr_id)): Path<(String, String, String)>,
+                          headers: HeaderMap| async move {
+            s.headers.lock().unwrap().push(headers);
+            Json(json!({
+                "id": pr_id,
+                "title": "PR title",
+                "source": { "repository": { "full_name": format!("{workspace}/{repo}") } }
+            }))
+        };
+
+        let app = Router::new()
+            .route("/repositories/{workspace}/{repo}", get(repo_handler))
+            .route(
+                "/repositories/{workspace}/{repo}/pullrequests/{pr_id}",
+                get(pr_handler),
+            )
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Give the server a moment to start listening.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        (port, captured)
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_repo_allowed_and_strips_headers() {
+        let (port, captured) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_repo",
+                json!({"repo_slug": "my-repo"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["full_name"], "WORK/my-repo");
+
+        let upstream_headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            upstream_headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer test-token"
+        );
+        assert!(!upstream_headers.contains_key("x-atlapool-key"));
+        assert!(!upstream_headers.contains_key("cookie"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_allowed() {
+        let (port, captured) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["id"], "42");
+
+        let upstream_headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            upstream_headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer test-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_repo_forbidden_repo_returns_403() {
+        let (port, _captured) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_repo",
+                json!({"repo_slug": "other-repo"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_upstream_not_configured_returns_503() {
+        let config = bitbucket_test_config(
+            "http://127.0.0.1:0".into(),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_repo",
+                json!({"repo_slug": "my-repo"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_repo_rejects_invalid_pull_request_id() {
+        let (port, _captured) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42/abc"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_repo_rejects_path_traversal_in_repo_slug() {
+        let (port, _captured) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["*".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_repo",
+                json!({"repo_slug": "../../other-workspace/secret-repo"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_rejects_path_traversal_in_repo_slug() {
+        let (port, _captured) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["*".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request",
+                json!({"repo_slug": "my-repo/../other", "pull_request_id": "42"}),
                 Some("agent-key"),
             ))
             .await

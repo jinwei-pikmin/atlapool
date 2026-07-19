@@ -1,5 +1,6 @@
 mod agents;
 mod audit;
+mod bitbucket;
 mod config;
 mod confluence;
 mod mcp;
@@ -25,6 +26,7 @@ struct AppState {
     config: Config,
     jira: Option<JiraClient>,
     confluence: Option<crate::confluence::ConfluenceClient>,
+    bitbucket: Option<crate::bitbucket::BitbucketClient>,
     audit: Option<crate::audit::AuditLog>,
 }
 
@@ -42,6 +44,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .as_ref()
         .map(crate::confluence::ConfluenceClient::new)
         .transpose()?;
+    let bitbucket = config
+        .bitbucket
+        .as_ref()
+        .map(crate::bitbucket::BitbucketClient::new)
+        .transpose()?;
     let audit_path = config
         .audit
         .path
@@ -53,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config: config.clone(),
         jira,
         confluence,
+        bitbucket,
         audit,
     };
     let app = router(state);
@@ -95,6 +103,7 @@ mod tests {
             config: Config::default(),
             jira: None,
             confluence: None,
+            bitbucket: None,
             audit: None,
         });
         let response = app
