@@ -291,6 +291,19 @@ fn resolve_target(
     args: Option<&Value>,
     workspace: Option<&str>,
 ) -> Result<ToolTarget, String> {
+    let valid_repo_slug = |s: &str| -> Result<(), String> {
+        if s.is_empty() {
+            return Err("repo_slug must not be empty".into());
+        }
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+        {
+            return Err("repo_slug contains invalid characters".into());
+        }
+        Ok(())
+    };
+
     match tool {
         "jira_get_issue" => {
             let args = args.ok_or("missing arguments")?;
@@ -491,9 +504,7 @@ fn resolve_target(
                 .get("repo_slug")
                 .and_then(|v| v.as_str())
                 .ok_or("missing repo_slug")?;
-            if repo_slug.is_empty() {
-                return Err("repo_slug must not be empty".into());
-            }
+            valid_repo_slug(repo_slug)?;
             let workspace = workspace.ok_or("missing bitbucket workspace")?;
             Ok(ToolTarget {
                 workspace: Some(workspace.into()),
@@ -511,9 +522,7 @@ fn resolve_target(
                 .get("repo_slug")
                 .and_then(|v| v.as_str())
                 .ok_or("missing repo_slug")?;
-            if repo_slug.is_empty() {
-                return Err("repo_slug must not be empty".into());
-            }
+            valid_repo_slug(repo_slug)?;
             let pull_request_id = args
                 .get("pull_request_id")
                 .and_then(|v| v.as_str())
@@ -1936,6 +1945,66 @@ mod tests {
             .oneshot(build_request(
                 "bitbucket_get_pull_request",
                 json!({"repo_slug": "my-repo", "pull_request_id": "42/abc"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_repo_rejects_path_traversal_in_repo_slug() {
+        let (port, _captured) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["*".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_repo",
+                json!({"repo_slug": "../../other-workspace/secret-repo"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_rejects_path_traversal_in_repo_slug() {
+        let (port, _captured) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["*".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request",
+                json!({"repo_slug": "my-repo/../other", "pull_request_id": "42"}),
                 Some("agent-key"),
             ))
             .await
