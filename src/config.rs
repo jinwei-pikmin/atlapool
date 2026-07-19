@@ -35,7 +35,6 @@ impl Default for Config {
 #[allow(dead_code)]
 pub struct AtlassianConfig {
     pub base_url: Option<String>,
-    pub email: Option<crate::secrets::SecretString>,
     pub cloud_id: Option<String>,
     pub token: Option<crate::secrets::SecretString>,
 }
@@ -100,13 +99,6 @@ impl Config {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut config: Config = toml::from_str(content)?;
         if let Some(ref mut atlassian) = config.atlassian {
-            if let Some(ref email) = atlassian.email {
-                let s = email.expose_secret();
-                if crate::secrets::is_secret_reference(s) {
-                    let resolved = crate::secrets::resolve(backend, s).await?;
-                    atlassian.email = Some(crate::secrets::SecretString::new(resolved));
-                }
-            }
             if let Some(ref cloud_id) = atlassian.cloud_id {
                 if crate::secrets::is_secret_reference(cloud_id) {
                     atlassian.cloud_id = Some(crate::secrets::resolve(backend, cloud_id).await?);
@@ -158,11 +150,10 @@ mod tests {
     }
 
     #[test]
-    fn config_debug_redacts_secret_token_and_email() {
+    fn config_debug_redacts_secret_token() {
         let config = Config {
             atlassian: Some(AtlassianConfig {
                 base_url: Some("https://example.atlassian.net".into()),
-                email: Some(crate::secrets::SecretString::new("agent@example.com")),
                 cloud_id: Some("test-cloud-id".into()),
                 token: Some(crate::secrets::SecretString::new("env:SOME_VAR")),
             }),
@@ -170,7 +161,6 @@ mod tests {
         };
         let debug = format!("{:?}", config);
         assert!(debug.contains("example.atlassian.net"));
-        assert!(!debug.contains("agent@example.com"));
         assert!(!debug.contains("env:SOME_VAR"));
         assert!(debug.contains("<redacted>"));
     }
