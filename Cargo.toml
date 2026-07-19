@@ -2,7 +2,7 @@
 name = "atlapool"
 version = "0.1.0"
 edition = "2021"
-description = "Atlassian credential proxy (Jira + Confluence) with per-agent allowlists"
+description = "Atlassian credential proxy (Jira + Confluence + Bitbucket) with per-agent allowlists"
 license = "MIT"
 
 [dependencies]
