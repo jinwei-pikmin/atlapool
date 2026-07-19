@@ -377,12 +377,16 @@ You need two values:
 
 1. **Scoped token** — a Service Account token with the required Atlassian OAuth
    scopes:
-   - Jira (read): `read:jira-work`
-   - Jira (write): `write:jira-work` (only if you enable write tools)
-   - Confluence (read): `read:page:confluence`, `read:comment:confluence`,
-     `read:attachment:confluence`
-   - Confluence (write): `write:page:confluence`, `write:comment:confluence`,
-     `write:attachment:confluence` (only if you enable write tools)
+   - Jira:
+     - `read:jira-work`
+     - `write:jira-work` (only if you enable write tools)
+   - Confluence:
+     - `read:page:confluence`
+     - `write:page:confluence` (only if you enable write tools)
+     - `read:attachment:confluence`
+     - `write:attachment:confluence` (only if you enable write tools)
+     - `read:comment:confluence`
+     - `write:comment:confluence` (only if you enable write tools)
 2. **Cloud ID** — the unique identifier of your Atlassian Cloud site. To find it,
    sign in to your site and open:
 
