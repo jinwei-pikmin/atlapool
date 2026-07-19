@@ -76,8 +76,8 @@ Request flow for `POST /mcp`:
 
 | Milestone | Status | Highlights |
 |---|---|---|
-| **v0.1** | ✅ Complete | 12 MCP tools for Jira, Confluence, and Bitbucket (read + write); write-gate; fail-closed audit attempt logging; per-agent allowlists; `env` / AWS / GCP secret resolution; `/health` and `/stats` endpoints. |
-| **v0.2** | 📋 Planned | Post-flight audit `result` records; per-tool / per-repo short-lived token minting; additional read tools such as `jira_search_issues`. |
+| **v0.1** | ✅ Complete | 12 MCP tools for Jira, Confluence, and Bitbucket (read + write); write-gate; fail-closed pre-flight `attempt` audit logging + post-flight `result` records; per-agent allowlists; `env` / AWS / GCP secret resolution; `/health` and `/stats` endpoints. |
+| **v0.2** | 📋 Planned | Per-tool / per-repo short-lived token minting; additional read tools such as `jira_search_issues`. |
 
 ## How clients use it
 

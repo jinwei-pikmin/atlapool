@@ -20,7 +20,7 @@ v0.1 功能已經齊全，但 README 仍偏「快速上手」取向，缺少與 
    - **Status**：v0.1 已完成 / v0.2 規劃中 的分期標示。
    - **How clients use it**：提供 MCP client（如 Claude Desktop）的 JSON 設定範例。
 2. Current limitation 明確寫出：atlapool 目前把同一組長效 Service Account token 原樣轉發給 upstream，不具備 ghpool 的短效 repo-scoped token 鑄造能力，這是 v0.1 的已知架構限制，v0.2 評估改進。
-3. 暫時不重寫「Read vs. write and audit」章節的欄位細節，等 Issue #52（audit result）merge 後再對齊 `audit.rs` 實際欄位。
+3. 「Read vs. write and audit」章節必須與 `src/audit.rs` 的 `AuditRecord` 欄位（`agent_id`、`tool`、`target`、`timestamp`、`result`、`status`、`message`）對齊，並把 post-flight `result` 記錄列為 v0.1 已完成的功能。
 
 ## 後果
 
