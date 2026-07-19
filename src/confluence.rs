@@ -1,17 +1,16 @@
 use crate::config::AtlassianConfig;
 use crate::upstream::UpstreamClient;
 use crate::upstream::UpstreamError;
-use reqwest::{Client, Method, Url};
+use reqwest::{header, Client, Method, Url};
 use serde_json::Value;
 
 /// Confluence Cloud REST client. Caller headers are **not** trusted; every
-/// request starts from an empty header set and is authenticated with the
-/// server-held Basic Auth credentials (`email:token`).
+/// request starts from an empty header set and receives the server-injected
+/// `Authorization: Bearer <token>` header only.
 #[derive(Clone)]
 pub struct ConfluenceClient {
     client: Client,
     base_url: String,
-    email: crate::secrets::SecretString,
     token: crate::secrets::SecretString,
 }
 
@@ -32,10 +31,6 @@ impl ConfluenceClient {
 
     pub fn new(config: &AtlassianConfig) -> Result<Self, UpstreamError> {
         let base_url = Self::api_base(config)?;
-        let email = config
-            .email
-            .clone()
-            .ok_or(UpstreamError::MissingConfig("email"))?;
         let token = config
             .token
             .clone()
@@ -43,12 +38,11 @@ impl ConfluenceClient {
         Ok(Self {
             client: Client::new(),
             base_url,
-            email,
             token,
         })
     }
 
-    /// Build a request from an empty header set, injecting only Basic Auth.
+    /// Build a request from an empty header set, injecting only the bearer token.
     pub fn request(
         &self,
         method: Method,
@@ -58,9 +52,9 @@ impl ConfluenceClient {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let url = Url::parse(&url).map_err(|_| UpstreamError::InvalidUrl(url.clone()))?;
 
-        let mut builder = self.client.request(method, url).basic_auth(
-            self.email.expose_secret().to_string(),
-            Some(self.token.expose_secret().to_string()),
+        let mut builder = self.client.request(method, url).header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", self.token.expose_secret()),
         );
 
         if let Some(body) = body {
@@ -81,7 +75,7 @@ impl ConfluenceClient {
     pub fn get_page_request(&self, page_id: &str) -> Result<reqwest::Request, UpstreamError> {
         self.request(
             Method::GET,
-            &format!("/wiki/rest/api/content/{page_id}?expand=body.storage"),
+            &format!("/wiki/api/v2/pages/{page_id}?body-format=view"),
             None,
         )
     }
@@ -114,7 +108,7 @@ mod tests {
     fn test_config() -> AtlassianConfig {
         AtlassianConfig {
             base_url: Some("https://example.atlassian.net".into()),
-            email: Some(SecretString::new("agent@example.com")),
+            email: None,
             cloud_id: None,
             token: Some(SecretString::new("test-token")),
         }
@@ -123,20 +117,20 @@ mod tests {
     fn cloud_id_config() -> AtlassianConfig {
         AtlassianConfig {
             base_url: None,
-            email: Some(SecretString::new("agent@example.com")),
+            email: None,
             cloud_id: Some("test-cloud-id".into()),
             token: Some(SecretString::new("test-token")),
         }
     }
 
     #[test]
-    fn get_page_request_injects_basic_auth() {
+    fn get_page_request_injects_bearer_token() {
         let client = ConfluenceClient::new(&test_config()).unwrap();
         let request = client.get_page_request("12345").unwrap();
         let headers = request.headers();
 
         let auth = headers.get(AUTHORIZATION).unwrap().to_str().unwrap();
-        assert!(auth.starts_with("Basic "));
+        assert_eq!(auth, "Bearer test-token");
     }
 
     #[test]
@@ -155,9 +149,9 @@ mod tests {
         let request = client.get_page_request("12345").unwrap();
 
         assert_eq!(request.method(), Method::GET);
-        assert_eq!(request.url().path(), "/wiki/rest/api/content/12345");
+        assert_eq!(request.url().path(), "/wiki/api/v2/pages/12345");
         let query: Vec<_> = request.url().query().unwrap().split('&').collect();
-        assert!(query.contains(&"expand=body.storage"));
+        assert!(query.contains(&"body-format=view"));
     }
 
     #[test]
@@ -168,7 +162,7 @@ mod tests {
         assert_eq!(request.url().host_str(), Some("api.atlassian.com"));
         assert_eq!(
             request.url().path(),
-            "/ex/confluence/test-cloud-id/wiki/rest/api/content/12345"
+            "/ex/confluence/test-cloud-id/wiki/api/v2/pages/12345"
         );
     }
 }

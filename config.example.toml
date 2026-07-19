@@ -11,25 +11,31 @@ port = 8080
 # The returned secret string is used as-is; JSON sub-key extraction is not supported yet.
 
 [atlassian]
-# Atlassian Cloud credentials. `email` and `token` are required for Basic Auth.
+# Atlassian Cloud credentials. For Service Account scoped tokens, only `token`
+# and `cloud_id` are required; the token is sent as `Authorization: Bearer <token>`.
+# `email` is optional and only relevant for classic token Basic Auth scenarios.
 # `cloud_id` is preferred for REST calls; if omitted, `base_url` is used as a
 # fallback (mainly useful for tests or on-prem installs).
 #
 # Find cloud_id by signing in to your Atlassian site and opening:
 #   https://<your-domain>.atlassian.net/_edge/tenant_info
 # The `cloudId` field is a UUID-like string.
-# email = "agent@example.com"
+# email = "agent@example.com"                          # optional
 # cloud_id = "12345678-1234-1234-1234-123456789abc"
 # base_url = "https://your-domain.atlassian.net"
 
 # Secret references also work for email and cloud_id:
 # email = "gcp:secretmanager:my-project/atlassian-email"
 # cloud_id = "gcp:secretmanager:my-project/atlassian-cloud-id"
-# email = "aws:secretsmanager:prod/atlassian/email"
 # cloud_id = "aws:secretsmanager:prod/atlassian/cloud-id"
 
-# Server-injected token used for Basic Auth. Create an API token at:
-# https://id.atlassian.com/manage-profile/security/api-tokens
+# Server-injected token sent as `Authorization: Bearer <token>`.
+# For Service Account scoped tokens, store the token here and grant the needed
+# Atlassian OAuth scopes in the Atlassian admin console:
+#   - Jira: read:jira-work / write:jira-work
+#   - Confluence: read:page:confluence, write:page:confluence,
+#                 read:comment:confluence, write:comment:confluence,
+#                 read:attachment:confluence, write:attachment:confluence
 # Choose one of the secret reference examples below:
 # token = "env:ATLASSIAN_TOKEN"                       # local environment variable
 # token = "aws:secretsmanager:prod/atlassian/token"   # AWS Secrets Manager

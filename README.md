@@ -38,7 +38,6 @@ cp config.example.toml config.toml
 port = 8080
 
 [atlassian]
-email = "env:ATLASSIAN_EMAIL"
 cloud_id = "env:ATLASSIAN_CLOUD_ID"
 token = "env:ATLASSIAN_TOKEN"
 
@@ -56,9 +55,8 @@ enable_writes = false
 Then export the secrets:
 
 ```sh
-export ATLASSIAN_EMAIL="agent@example.com"
 export ATLASSIAN_CLOUD_ID="your-cloud-id"
-export ATLASSIAN_TOKEN="your-atlassian-api-token"
+export ATLASSIAN_TOKEN="your-atlassian-scoped-token"
 export ATLAPOOL_KEY_DEMO="demo-secret-key"
 ```
 
@@ -69,7 +67,6 @@ docker build -t atlapool .
 docker run -d --name atlapool \
   -p 8080:8080 \
   -e PORT=8080 \
-  -e ATLASSIAN_EMAIL \
   -e ATLASSIAN_CLOUD_ID \
   -e ATLASSIAN_TOKEN \
   -e ATLAPOOL_KEY_DEMO \
@@ -129,9 +126,8 @@ If you already have a Rust toolchain:
 ```sh
 cp config.example.toml config.toml
 # edit config.toml as above
-export ATLASSIAN_EMAIL="agent@example.com"
 export ATLASSIAN_CLOUD_ID="your-cloud-id"
-export ATLASSIAN_TOKEN="your-atlassian-api-token"
+export ATLASSIAN_TOKEN="your-atlassian-scoped-token"
 export ATLAPOOL_KEY_DEMO="demo-secret-key"
 cargo run
 ```
@@ -244,11 +240,9 @@ Examples:
 
 ```toml
 [atlassian]
-# email = "env:ATLASSIAN_EMAIL"
-# cloud_id = "env:ATLASSIAN_CLOUD_ID"
-# base_url = "https://your-domain.atlassian.net"
-# email = "agent@example.com"
 # cloud_id = "12345678-1234-1234-1234-123456789abc"
+# base_url = "https://your-domain.atlassian.net"
+# email = "agent@example.com"                        # optional
 # token = "env:ATLASSIAN_TOKEN"
 # token = "aws:secretsmanager:prod/atlassian/token"
 # token = "gcp:secretmanager:my-project/atlassian-token"
@@ -256,13 +250,17 @@ Examples:
 
 ### Atlassian credentials
 
-You need three values from your Atlassian Cloud site:
+For Service Account scoped tokens you need two values:
 
-1. **Email** — the Atlassian account email used for Basic Auth.
-2. **API token** — create one at
-   [https://id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens).
-3. **Cloud ID** — the unique identifier of your Atlassian Cloud site. To find
-   it, sign in to your site and open:
+1. **Scoped token** — a Service Account token with the required Atlassian OAuth
+   scopes. atlapool sends it as `Authorization: Bearer <token>`.
+   Required scopes:
+   - Jira (OAuth-style): `read:jira-work` and/or `write:jira-work`
+   - Confluence (granular): `read:page:confluence`, `write:page:confluence`,
+     `read:comment:confluence`, `write:comment:confluence`,
+     `read:attachment:confluence`, `write:attachment:confluence`
+2. **Cloud ID** — the unique identifier of your Atlassian Cloud site. To find it,
+   sign in to your site and open:
 
    ```
    https://<your-domain>.atlassian.net/_edge/tenant_info
@@ -277,13 +275,13 @@ You need three values from your Atlassian Cloud site:
 
    and `cloudId` looks like `12345678-1234-1234-1234-123456789abc`.
 
-The `base_url` field (`https://<your-domain>.atlassian.net`) is kept for
-human-readable links and for looking up the cloud ID. After Issue #25, the
-actual REST calls are sent through the `api.atlassian.com` gateway using
-`cloud_id`:
+`email` is optional and only useful if you later switch to a classic token with
+Basic Auth. `base_url` is optional and kept for human-readable links or for
+looking up the cloud ID. REST calls are sent through the `api.atlassian.com`
+gateway using `cloud_id`:
 
 - Jira: `https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/...`
-- Confluence: `https://api.atlassian.com/ex/confluence/{cloud_id}/wiki/rest/api/...`
+- Confluence: `https://api.atlassian.com/ex/confluence/{cloud_id}/wiki/api/v2/...`
 
 ### Agent allowlists
 
@@ -339,10 +337,10 @@ Run it in one terminal, set `base_url = "http://127.0.0.1:9001"` in
 | `missing or empty X-Atlapool-Key` | Request lacks the `X-Atlapool-Key` header. | Add `-H "X-Atlapool-Key: your-key"`. |
 | `unknown key` | The key is not in any `agents.keys` list. | Check `config.toml` keys and secret resolution. |
 | `not permitted by agent policy` | Tool, project, or space is not allowed. | Verify `tools`, `projects`, and `spaces` arrays for the agent. |
-| `write tools not enabled for agent` | Calling `jira_create_issue` without `enable_writes = true`. | Set `enable_writes = true` for that agent. |
+| `write tools not enabled for agent` | Calling a write tool without `enable_writes = true`. | Set `enable_writes = true` for that agent. |
 | `audit log not configured` / `audit log write failed` | The audit log path is missing or unwritable. | Set `audit.path` or ensure the directory exists. |
-| `upstream not configured` / `confluence upstream not configured` | `[atlassian]` section is missing or `base_url`/`token` are empty. | Fill in `email`, `token`, and `cloud_id` (or `base_url` as fallback). |
-| `unsupported tool` | The tool name is not implemented or not in the agent `tools` list. | Use `jira_get_issue`, `jira_create_issue`, or `confluence_get_page`. |
+| `upstream not configured` / `confluence upstream not configured` | `[atlassian]` section is missing or `base_url`/`token` are empty. | Fill in `token` and `cloud_id` (or `base_url` as fallback). |
+| `unsupported tool` | The tool name is not implemented or not in the agent `tools` list. | Use `jira_get_issue`, `jira_create_issue`, `jira_add_comment`, or `confluence_get_page`. |
 | Jira returns 401 or 403 | The Atlassian token is invalid or lacks permissions. | Regenerate `ATLASSIAN_TOKEN` and check project access. |
 
 ## License
