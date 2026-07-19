@@ -502,7 +502,8 @@ least:
 
 - `repository:read` — for `bitbucket_get_repo`
 - `pullrequest:read` — for `bitbucket_get_pull_request`
-- `repository:write` — for `bitbucket_create_repo`, `bitbucket_create_branch`, `bitbucket_create_commit`
+- `repository:write` — for `bitbucket_create_branch`, `bitbucket_create_commit`
+- `repository:admin` — for `bitbucket_create_repo` (Bitbucket's API requires admin scope to create repositories; this is different from `repository:write`)
 - `pullrequest:write` — for `bitbucket_create_pull_request`
 
 Bitbucket calls are sent to `https://api.bitbucket.org/2.0` (or `bitbucket.base_url`

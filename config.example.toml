@@ -50,6 +50,7 @@ port = 8080
 # Required Bitbucket App password / OAuth consumer permissions:
 #   - read: repository:read, pullrequest:read
 #   - write: repository:write, pullrequest:write
+#   - create repository: repository:admin (Bitbucket requires admin scope for repo creation)
 #
 # token supports the same secret reference formats as atlassian.token:
 # token = "env:BITBUCKET_TOKEN"
