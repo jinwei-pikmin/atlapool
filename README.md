@@ -158,12 +158,14 @@ Call `POST /mcp` with a JSON-RPC 2.0 envelope:
 |---|---|---|---|---|---|
 | `jira_get_issue` | Fetch a Jira issue by key | `issue_key` (e.g. `PROJ-123`) | `projects` (parsed from key) | No | No |
 | `jira_create_issue` | Create a Jira issue | `project`, `summary`, plus any Jira `fields` | `projects` (from `project`) | Yes (`enable_writes = true`) | Yes |
+| `jira_add_comment` | Add a comment to a Jira issue | `issue_key`, `body` (ADF, forwarded as-is) | `projects` (parsed from key) | Yes | Yes |
 | `confluence_get_page` | Fetch a Confluence page by ID | `page_id` (numeric page ID), `space` | `spaces` | No | No |
 
 The allowlist is deny-by-default: an agent must list the exact tool name and
 must also match the `project` or `space` dimension. Read tools (`jira_get_issue`,
-`confluence_get_page`) work when `enable_writes` is `false`. The write tool
-(`jira_create_issue`) needs `enable_writes = true` and a writable `audit.path`.
+`confluence_get_page`) work when `enable_writes` is `false`. Write tools
+(`jira_create_issue`, `jira_add_comment`) need `enable_writes = true` and a
+writable `audit.path`.
 
 ### Examples
 
@@ -208,6 +210,26 @@ curl -s -X POST http://localhost:8080/mcp \
 > For real Jira, `description` and `comment` bodies must be in Atlassian
 > Document Format (ADF). atlapool currently forwards the body as-is, so the
 > caller is responsible for building valid ADF.
+
+**Add a comment to a Jira issue**
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "jira_add_comment",
+      "arguments": {
+        "issue_key": "PROJ-123",
+        "body": { "type": "doc", "version": 1, "content": [] }
+      }
+    }
+  }'
+```
 
 **Read a Confluence page**
 

@@ -300,6 +300,22 @@ fn resolve_target(tool: &str, args: Option<&Value>) -> Result<ToolTarget, String
                 body: Some(args.clone()),
             })
         }
+        "jira_add_comment" => {
+            let args = args.ok_or("missing arguments")?;
+            let issue_key = args
+                .get("issue_key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing issue_key")?;
+            let project = issue_key.split_once('-').map(|(p, _)| p.to_string());
+            let body = args.get("body").cloned().ok_or("missing body")?;
+            Ok(ToolTarget {
+                project,
+                space: None,
+                method: Method::POST,
+                path: format!("/rest/api/3/issue/{issue_key}/comment"),
+                body: Some(json!({ "body": body })),
+            })
+        }
         "confluence_get_page" => {
             let args = args.ok_or("missing arguments")?;
             let space = args
@@ -373,7 +389,11 @@ mod tests {
             agents: vec![AgentConfig {
                 id: "demo".into(),
                 keys: vec![SecretString::new("agent-key")],
-                tools: vec!["jira_get_issue".into(), "jira_create_issue".into()],
+                tools: vec![
+                    "jira_get_issue".into(),
+                    "jira_create_issue".into(),
+                    "jira_add_comment".into(),
+                ],
                 projects: vec!["PROJ".into()],
                 spaces: vec![],
                 enable_writes,
@@ -461,9 +481,23 @@ mod tests {
             }))
         };
 
+        let comment_handler = |State(s): State<MockState>,
+                               Path(_): Path<String>,
+                               headers: HeaderMap,
+                               body: Bytes| async move {
+            s.headers.lock().unwrap().push(headers);
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_default();
+            Json(json!({
+                "id": "10001",
+                "self": "/rest/api/3/comment/10001",
+                "body": payload
+            }))
+        };
+
         let app = Router::new()
             .route("/rest/api/3/issue/{key}", get(get_handler))
             .route("/rest/api/3/issue", post(post_handler))
+            .route("/rest/api/3/issue/{key}/comment", post(comment_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -703,6 +737,144 @@ mod tests {
         assert!(line.contains("\"result\":\"attempt\""));
 
         std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_add_comment_allowed_and_strips_headers() {
+        let (port, captured) = mock_jira_server().await;
+        let config = test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            Some(temp_audit_path()),
+        );
+        let audit_path = config.audit.path.clone().unwrap();
+        let audit = Some(AuditLog::new(audit_path.clone()));
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            audit,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_add_comment",
+                json!({
+                    "issue_key": "PROJ-123",
+                    "body": { "type": "doc", "version": 1, "content": [] }
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["body"]["body"]["type"], "doc");
+
+        let upstream_headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            upstream_headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Basic YWdlbnRAZXhhbXBsZS5jb206dGVzdC10b2tlbg=="
+        );
+        assert!(!upstream_headers.contains_key("x-atlapool-key"));
+        assert!(!upstream_headers.contains_key("cookie"));
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        let line = log.trim();
+        assert!(line.contains("\"agent_id\":\"demo\""));
+        assert!(line.contains("\"tool\":\"jira_add_comment\""));
+        assert!(line.contains("\"target\":\"PROJ\""));
+        assert!(line.contains("\"result\":\"attempt\""));
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_add_comment_forbidden_project_returns_403() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_add_comment",
+                json!({
+                    "issue_key": "OTHER-123",
+                    "body": { "type": "doc", "version": 1 }
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_add_comment_write_disabled_returns_403() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_add_comment",
+                json!({
+                    "issue_key": "PROJ-123",
+                    "body": { "type": "doc", "version": 1 }
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_add_comment_rejects_missing_body() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), true, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_add_comment",
+                json!({"issue_key": "PROJ-123"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
