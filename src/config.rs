@@ -33,6 +33,8 @@ impl Default for Config {
 #[allow(dead_code)]
 pub struct AtlassianConfig {
     pub base_url: Option<String>,
+    pub email: Option<String>,
+    pub cloud_id: Option<String>,
     pub token: Option<crate::secrets::SecretString>,
 }
 
@@ -88,6 +90,16 @@ impl Config {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut config: Config = toml::from_str(content)?;
         if let Some(ref mut atlassian) = config.atlassian {
+            if let Some(ref email) = atlassian.email {
+                if crate::secrets::is_secret_reference(email) {
+                    atlassian.email = Some(crate::secrets::resolve(backend, email).await?);
+                }
+            }
+            if let Some(ref cloud_id) = atlassian.cloud_id {
+                if crate::secrets::is_secret_reference(cloud_id) {
+                    atlassian.cloud_id = Some(crate::secrets::resolve(backend, cloud_id).await?);
+                }
+            }
             if let Some(token) = atlassian.token.as_ref() {
                 let s = token.expose_secret();
                 if crate::secrets::is_secret_reference(s) {
@@ -129,6 +141,8 @@ mod tests {
         let config = Config {
             atlassian: Some(AtlassianConfig {
                 base_url: Some("https://example.atlassian.net".into()),
+                email: Some("agent@example.com".into()),
+                cloud_id: Some("test-cloud-id".into()),
                 token: Some(crate::secrets::SecretString::new("env:SOME_VAR")),
             }),
             ..Config::default()
