@@ -2,16 +2,16 @@
 
 Atlassian credential proxy for MCP agents.
 
-atlapool lets an MCP client use Jira and Confluence tools without holding the
-real Atlassian API token. The server injects the token, strips caller headers,
-enforces per-agent allowlists, gates writes, and logs every write attempt.
+atlapool lets an MCP client use Jira, Confluence, and Bitbucket tools without
+holding the real Atlassian API token. The server injects the token, strips
+caller headers, enforces per-agent allowlists, gates writes, and logs every
+write attempt.
 
 ## Status
 
-v1 core features are complete: `/health`, `/stats`, `/mcp` with
-`jira_get_issue`, `jira_create_issue`, and `confluence_get_page`, three secret
-backends (env, AWS Secrets Manager, GCP Secret Manager), per-agent allowlists,
-write-gate, and fail-closed audit logging.
+v0.1.0 features are complete: `/health`, `/stats`, `/mcp` with the tools listed
+below, three secret backends (env, AWS Secrets Manager, GCP Secret Manager),
+per-agent allowlists, write-gate, and fail-closed audit logging.
 
 ## What you need
 
@@ -539,9 +539,10 @@ request is rejected before the upstream call.
 
 ## Testing with a mock upstream
 
-If you do not have a live Atlassian account, point `atlassian.base_url` at a
-mock server and add a fake token. The proxy does not validate the token itself;
-Jira will. For example, start a tiny Python mock:
+If you do not have a live Atlassian account, point `atlassian.base_url` or
+`bitbucket.base_url` at a mock server and add a fake token. The proxy does not
+validate the token itself; the upstream server will. For example, start a tiny
+Python mock for Jira:
 
 ```python
 from http.server import HTTPServer, BaseHTTPRequestHandler
