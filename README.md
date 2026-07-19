@@ -1,25 +1,125 @@
 # atlapool
 
-Atlassian credential proxy for MCP agents.
+A secure, cloud-native Atlassian gateway for AI agents. MCP clients get Jira,
+Confluence, and Bitbucket tools **without holding any Atlassian credential** —
+atlapool authenticates each agent, enforces per-agent default-deny policy,
+injects the real token upstream, and audit-logs every write operation.
 
-atlapool lets an MCP client use Jira, Confluence, and Bitbucket tools without
-holding the real Atlassian API token. The server injects the token, strips
-caller headers, enforces per-agent allowlists, gates writes, and logs every
-write attempt.
+> Onboarding: [Quick start](#quick-start) · Configuration: [config.example.toml](config.example.toml) · Architecture decisions: [docs/adr/](docs/adr/)
+
+## Design Principles
+
+- **No Atlassian credential on the agent** — agents hold only an atlapool API
+  key (revocable, policy-bounded, not an Atlassian token). The Atlassian and
+  Bitbucket credentials live in exactly one place: atlapool.
+- **Default-deny policy engine** — each agent gets an exact tool allowlist plus
+  `projects`, `spaces`, `bitbucket_workspaces`, and `bitbucket_repos` allowlists;
+  new tools and dimensions are denied until explicitly granted.
+- **Fail-closed audit for writes** — every write tool writes an `attempt` record
+  before the upstream call. If the audit write fails, the request is aborted.
+- **Cloud-native** — runs as a single static binary or container, listens on the
+  configured `port`, and resolves credentials from `env`, AWS Secrets Manager, or
+  GCP Secret Manager.
+- **Bearer token injection** — atlapool forwards upstream requests with
+  `Authorization: Bearer <token>` after stripping caller-supplied sensitive
+  headers.
+- **Current limitation** — atlapool currently forwards the **same long-lived
+  Service Account token** to every upstream request. It does **not** mint
+  per-repo or per-session short-lived tokens like ghpool's GitHub App
+  installation tokens. This is a known architectural limitation; short-lived
+  credential minting is planned for a future release.
+
+## Architecture
+
+```text
+                         Private Network / VPC
+   ┌─────────┐      ┌───────────────────────────────────────┐
+   │ Agent A │──────│              atlapool                 │
+   └─────────┘      │  ┌─────────────────────────────────┐  │
+                    │  │ Agent auth (X-Atlapool-Key)     │  │
+                    │  │ + default-deny tool / project / │  │
+                    │  │   space / workspace / repo      │  │
+                    │  │   policy                        │  │
+                    │  └─────────────────────────────────┘  │
+                    │  ┌───────────────┐ ┌───────────────┐  │
+                    │  │ Write gate    │ │ Audit log     │  │
+                    │  │ (fail-closed) │ │ (JSONL)       │  │
+                    │  └───────────────┘ └───────────────┘  │
+                    │  ┌─────────────────────────────────┐  │
+                    │  │ Secret resolver                 │  │
+                    │  │ env / AWS / GCP                 │  │
+                    │  └─────────────────────────────────┘  │
+                    │  ┌─────────────────────────────────┐  │
+                    │  │ Upstream client (Jira /       │  │
+                    │  │ Confluence / Bitbucket)         │  │
+                    │  └─────────────────────────────────┘  │
+                    └───────────┬─────────────┬───────────┘
+                                │             │
+                                ▼             ▼
+              ┌────────────────────────┐  ┌────────────────────┐
+              │ api.atlassian.com      │  │ api.bitbucket.org  │
+              │ (Jira + Confluence)    │  │ (Bitbucket)        │
+              └────────────────────────┘  └────────────────────┘
+```
+
+Request flow for `POST /mcp`:
+
+1. Authenticate `X-Atlapool-Key` and load the matching agent policy.
+2. Resolve `tool`, `project`, `space`, `workspace`, and `repo` allowlists.
+3. For write tools: verify `enable_writes = true` and write a fail-closed
+   `attempt` audit record.
+4. Build the upstream request from an empty header set, inject the configured
+   `Authorization: Bearer <token>`, and forward it.
+5. Return the upstream response to the caller.
 
 ## Status
 
-v0.1.0 features are complete: `/health`, `/stats`, `/mcp` with the tools listed
-below, three secret backends (env, AWS Secrets Manager, GCP Secret Manager),
-per-agent allowlists, write-gate, and fail-closed audit logging.
+| Milestone | Status | Highlights |
+|---|---|---|
+| **v0.1** | ✅ Complete | 12 MCP tools for Jira, Confluence, and Bitbucket (read + write); write-gate; fail-closed audit attempt logging; per-agent allowlists; `env` / AWS / GCP secret resolution; `/health` and `/stats` endpoints. |
+| **v0.2** | 📋 Planned | Post-flight audit `result` records; per-tool / per-repo short-lived token minting; additional read tools such as `jira_search_issues`. |
 
-## What you need
+## How clients use it
 
-- Docker (recommended) or a Rust toolchain.
-- A running Atlassian Cloud site and an API token, **or** a local mock
-  Atlassian server for testing.
-- 5–10 minutes to configure and 30 minutes or less from clone to the first
-  successful `/mcp` call.
+atlapool exposes a single JSON-RPC 2.0 endpoint at `POST /mcp`. Any MCP client
+that can set a custom HTTP header can connect.
+
+### Claude Desktop (example)
+
+```json
+{
+  "mcpServers": {
+    "atlapool": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote"],
+      "env": {
+        "MCP_REMOTE_URL": "http://localhost:8080/mcp",
+        "MCP_REMOTE_HEADER": "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO"
+      }
+    }
+  }
+}
+```
+
+Replace `http://localhost:8080/mcp` with the deployed URL and set the header
+value to the agent key configured in `config.toml`.
+
+### Raw HTTP
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "jira_get_issue",
+      "arguments": { "issue_key": "PROJ-123" }
+    }
+  }'
+```
 
 ## Quick start (Docker)
 
