@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Bitbucket browse tools:
+  - `bitbucket_list_branches`
+  - `bitbucket_list_directory`
+  - `bitbucket_get_file_content`
+
 ## [0.1.0] - 2026-07-19
 
 ### Added
