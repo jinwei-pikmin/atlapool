@@ -14,7 +14,7 @@ All notable changes to this project will be documented in this file.
   - `initialize` handshake (no key required)
   - `tools/list` returning per-agent allowed tools with JSON Schema `inputSchema`
   - `notifications/initialized` support on `POST /mcp/notify`
-  - `tools/call` wraps upstream JSON in `CallToolResult` when `Mcp-Protocol-Version` header is present
+  - `tools/call` now returns standard MCP `CallToolResult` with `content`, `isError`, and `structuredContent`
   - Full `initialize` → `tools/list` → `tools/call` flow verified with the official `rmcp` client library over a real TCP listener
 
 ## [0.1.0] - 2026-07-19

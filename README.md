@@ -311,10 +311,25 @@ Then use the same `curl` commands as above.
 - `tools/list` — returns the agent's allowed tools with `inputSchema`.
 - `tools/call` — invokes a tool with arguments.
 
-`tools/call` returns the upstream JSON directly by default. When the request
-includes the `Mcp-Protocol-Version` header (as standard MCP clients such as
-`rmcp` do after initialization), the upstream JSON is wrapped in a standard
-`CallToolResult` with `content`, `isError: false`, and `structuredContent`.
+`tools/call` returns a standard MCP `CallToolResult`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "content": [{ "type": "text", "text": "..." }],
+    "isError": false,
+    "structuredContent": { ... }
+  }
+}
+```
+
+- If the upstream response is a JSON object, `structuredContent` contains the
+  original object and `content[0].text` is its JSON string representation.
+- If the upstream response is plain text or non-JSON, `content[0].text` is the
+  raw text and `structuredContent` is omitted.
+- For 204/empty responses, `structuredContent` is `{}`.
 
 Example `tools/call` envelope:
 
