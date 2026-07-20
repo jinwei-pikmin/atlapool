@@ -570,6 +570,9 @@ projects = ["PROJ"]
 spaces = ["SPACE"]
 bitbucket_workspaces = ["my-workspace"]
 bitbucket_repos = ["my-repo"]
+# Multiple repos or a glob are also valid, e.g.
+# bitbucket_repos = ["repo-a", "repo-b", "repo-c"]
+# bitbucket_repos = ["*"]  # allow all repos in the workspace
 enable_writes = true
 ```
 
@@ -581,6 +584,9 @@ Notes:
   set.
 - `bitbucket.workspace` is required for all Bitbucket tools and is injected by
   the server; the caller cannot override it.
+- `bitbucket_repos` is an array and supports glob `*`, just like `projects` and
+  `spaces`. You can list multiple repos (e.g. `["repo-a", "repo-b"]`) or allow
+  all repos in the workspace with `["*"]`.
 
 ### Secret reference formats
 
