@@ -508,6 +508,9 @@ fn resolve_target(
         if s.is_empty() {
             return Err("ref must not be empty".into());
         }
+        if s == "." || s == ".." {
+            return Err("ref must not be '.' or '..'".into());
+        }
         if s.starts_with('/') {
             return Err("ref must not start with '/'".into());
         }
@@ -4186,6 +4189,36 @@ mod tests {
             .oneshot(build_request(
                 "bitbucket_list_directory",
                 json!({"repo_slug": "my-repo", "ref": "feature/x"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_list_directory_rejects_ref_dotdot() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["*".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_list_directory",
+                json!({"repo_slug": "my-repo", "ref": ".."}),
                 Some("agent-key"),
             ))
             .await
