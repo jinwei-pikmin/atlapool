@@ -24,6 +24,7 @@ Accepted — 凱撒/至尊裁定後執行
 
 - `push` 到 `main`：產生 `latest` 與 git short sha 兩個 tag。
 - `push` tag `v*`（例如 `v0.1.0`）：產生該版本號 tag。
+- `workflow_dispatch`：手動輸入 `image_tag`（例如 `v0.1.0`），用於補推已經存在的 git tag 對應的 image，而不移動實際 tag。
 
 ### Tag 策略
 
@@ -31,7 +32,8 @@ Accepted — 凱撒/至尊裁定後執行
 
 - `type=raw,value=latest,enable={{is_default_branch}}`
 - `type=sha,prefix=,suffix=,format=short`
-- `type=ref,event=tag`
+- `type=ref,event=tag`（只在 `push` 事件時啟用）
+- `type=raw,value=${{ github.event.inputs.image_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}`（只在手動觸發時啟用）
 
 ### 權限與公開
 
