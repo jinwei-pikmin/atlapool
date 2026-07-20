@@ -6,6 +6,7 @@ RUN cargo build --release
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
+LABEL org.opencontainers.image.source="https://github.com/jinwei-pikmin/atlapool"
 COPY --from=builder /app/target/release/atlapool /atlapool
 ENV PORT=8080
 EXPOSE 8080

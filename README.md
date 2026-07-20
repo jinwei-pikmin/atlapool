@@ -123,6 +123,38 @@ curl -s -X POST http://localhost:8080/mcp \
   }'
 ```
 
+## Quick start with published image
+
+No clone required. Pull a released image and run it with your own `config.toml`:
+
+```sh
+# Copy and edit the example config locally
+curl -sSL https://raw.githubusercontent.com/jinwei-pikmin/atlapool/main/config.example.toml -o config.toml
+# edit config.toml with your credentials and agent settings
+
+docker run -d --name atlapool \
+  -p 8080:8080 \
+  -e ATLAPOOL_CONFIG=/config.toml \
+  -e ATLASSIAN_CLOUD_ID \
+  -e ATLASSIAN_TOKEN \
+  -e ATLAPOOL_KEY_DEMO \
+  -v "$(pwd)/config.toml:/config.toml:ro" \
+  ghcr.io/jinwei-pikmin/atlapool:v0.1.0
+```
+
+Replace `v0.1.0` with `latest`, a short SHA tag, or any released version. Once
+running, check `/health`:
+
+```sh
+curl -s http://localhost:8080/health
+```
+
+Expected response:
+
+```json
+{"status":"ok"}
+```
+
 ## Quick start (Docker)
 
 1. Clone the repo and copy the example config.
