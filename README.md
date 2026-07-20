@@ -142,6 +142,11 @@ docker run -d --name atlapool \
   ghcr.io/jinwei-pikmin/atlapool:v0.1.0
 ```
 
+> **Note:** the first release to GHCR defaults to a private package. Ask the
+> repository owner to set the `ghcr.io/jinwei-pikmin/atlapool` package
+> visibility to **Public** on the GitHub package settings page before running
+> `docker pull` without authentication.
+
 Replace `v0.1.0` with `latest`, a short SHA tag, or any released version. Once
 running, check `/health`:
 

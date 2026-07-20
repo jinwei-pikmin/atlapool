@@ -37,7 +37,7 @@ Accepted — 凱撒/至尊裁定後執行
 
 - Workflow job `permissions`：`packages: write`（推送）、`contents: read`（checkout）。
 - `docker/login-action` 以 `ghcr.io` 為 registry，`username: ${{ github.actor }}`，`password: ${{ secrets.GITHUB_TOKEN }}`。
-- 推送後執行 `gh api` 檢查並將組織層級 package 設為 `public`；若權限不足則改由 package 設定頁手動公開。
+- 首次推送到 GHCR 後，package 預設為 **private**。由於 `GITHUB_TOKEN` 不一定具備變更個人帳號 package visibility 的權限，因此不在 CI 中嘗試自動設公開，避免默默失敗。首次 release 需由 package 擁有者到 GitHub 的 package 設定頁手動改為 `Public`（一次性動作），之後阿格里帕以未登入的 `docker pull` 驗證 AC3。
 
 ### README
 
