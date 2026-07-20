@@ -302,6 +302,9 @@ Call `POST /mcp` with a JSON-RPC 2.0 envelope:
 | `confluence_update_page` | Update a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `page_id` (numeric ID), `title`, `version`, `body` (storage HTML) | `spaces` | Yes | Yes |
 | `bitbucket_get_repo` | Fetch a Bitbucket repository | `repo_slug` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_get_pull_request` | Fetch a Bitbucket pull request | `repo_slug`, `pull_request_id` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
+| `bitbucket_list_branches` | List branches in a Bitbucket repository | `repo_slug` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
+| `bitbucket_list_directory` | List files/directories at a path in a repo | `repo_slug`, optional `path`, optional `ref` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
+| `bitbucket_get_file_content` | Read the raw contents of a file in a repo | `repo_slug`, `path`, optional `ref` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_create_repo` | Create a Bitbucket repository | `repo_slug` (from config `workspace`), optional `is_private` (default `true`) | `bitbucket_workspaces`, `bitbucket_repos` | Yes | Yes |
 | `bitbucket_create_branch` | Create a branch in a repository | `repo_slug`, `branch_name`, `target_hash` | `bitbucket_workspaces`, `bitbucket_repos` | Yes | Yes |
 | `bitbucket_create_commit` | Create a commit by uploading files | `repo_slug`, `message`, `branch`, `files` (map of path → content) | `bitbucket_workspaces`, `bitbucket_repos` | Yes | Yes |
@@ -605,6 +608,9 @@ tools = [
   "confluence_update_page",
   "bitbucket_get_repo",
   "bitbucket_get_pull_request",
+  "bitbucket_list_branches",
+  "bitbucket_list_directory",
+  "bitbucket_get_file_content",
   "bitbucket_create_repo",
   "bitbucket_create_branch",
   "bitbucket_create_commit",
@@ -777,7 +783,7 @@ Choose one of the following authentication methods:
    `[bitbucket.oauth]`. atlapool will fetch a 2-hour access token and refresh it
    before expiry. The consumer must be granted at least:
 
-   - `repository:read` — for `bitbucket_get_repo`
+   - `repository:read` — for `bitbucket_get_repo`, `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`
    - `pullrequest:read` — for `bitbucket_get_pull_request`
    - `repository:write` — for `bitbucket_create_branch`, `bitbucket_create_commit`
    - `repository:admin` — for `bitbucket_create_repo` (Bitbucket's API requires admin scope to create repositories; this is different from `repository:write`)
@@ -799,6 +805,7 @@ if overridden):
 - Pull request: `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/pullrequests/{pull_request_id}`
 - Branches: `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/refs/branches`
 - Source (commit): `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/src`
+- Source (ref/path): `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/src/{ref}/{path}`
 - Pull requests: `https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/pullrequests`
 
 ### Bitbucket scopes
@@ -818,7 +825,7 @@ pullrequest:write
 Scope-to-tool mapping:
 
 - `repository:admin` — `bitbucket_create_repo` (Bitbucket requires admin scope for repository creation)
-- `repository:read` — `bitbucket_get_repo`
+- `repository:read` — `bitbucket_get_repo`, `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`
 - `repository:write` — `bitbucket_create_branch`, `bitbucket_create_commit`
 - `pullrequest:read` — `bitbucket_get_pull_request`
 - `pullrequest:write` — `bitbucket_create_pull_request`
@@ -837,7 +844,8 @@ Scope-to-tool mapping:
 ### Read vs. write and audit
 
 Read tools (`jira_get_issue`, `confluence_get_page`, `bitbucket_get_repo`,
-`bitbucket_get_pull_request`) pass through the allowlist and do not touch the
+`bitbucket_get_pull_request`, `bitbucket_list_branches`, `bitbucket_list_directory`,
+`bitbucket_get_file_content`) pass through the allowlist and do not touch the
 audit log.
 
 Write tools (`jira_create_issue`, `jira_add_comment`, `confluence_create_page`,

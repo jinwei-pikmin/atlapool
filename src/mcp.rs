@@ -43,6 +43,10 @@ struct ToolTarget {
     /// after authorization and write-gate, because `description_append` may
     /// require fetching the existing ADF first.
     update: Option<UpdateIssueFields>,
+    /// Staging fields for `bitbucket_list_directory` and
+    /// `bitbucket_get_file_content`; when `ref` is omitted the default branch is
+    /// resolved after authorization.
+    resolve_ref: Option<ResolveRef>,
 }
 
 #[derive(Default)]
@@ -51,6 +55,15 @@ struct UpdateIssueFields {
     summary: Option<String>,
     assignee: Option<String>,
     description_append: Option<String>,
+}
+
+struct ResolveRef {
+    /// Path prefix of the repository, e.g. `/repositories/WORK/my-repo`.
+    repo_prefix: String,
+    /// Sub-path within the repository; empty for root.
+    sub_path: String,
+    /// When true the resolved URL ends with `/` (directory listing).
+    trailing_slash: bool,
 }
 
 impl ToolTarget {
@@ -256,6 +269,18 @@ pub async fn mcp_handler(
                 "bitbucket upstream not configured",
             );
         };
+
+        // bitbucket_list_directory and bitbucket_get_file_content may need to
+        // resolve the repository default branch before hitting the Source API.
+        if let Some(resolve) = target.resolve_ref.take() {
+            match resolve_bitbucket_default_branch(bitbucket, resolve).await {
+                Ok(path) => target.path = path,
+                Err((status, message)) => {
+                    return mcp_error(request.id, status, &message);
+                }
+            }
+        }
+
         forward(
             bitbucket,
             audit,
@@ -468,6 +493,32 @@ fn resolve_target(
         }
         Ok(())
     };
+    let valid_repo_path = |s: &str| -> Result<(), String> {
+        if s.starts_with('/') {
+            return Err("path must not start with '/'".into());
+        }
+        for segment in s.split('/') {
+            if segment == ".." {
+                return Err("path contains invalid '..' segment".into());
+            }
+        }
+        Ok(())
+    };
+    let valid_ref_name = |s: &str| -> Result<(), String> {
+        if s.is_empty() {
+            return Err("ref must not be empty".into());
+        }
+        if s == "." || s == ".." {
+            return Err("ref must not be '.' or '..'".into());
+        }
+        if s.starts_with('/') {
+            return Err("ref must not start with '/'".into());
+        }
+        if s.contains('/') {
+            return Err("ref must not contain '/'; use a commit hash for branches with '/'".into());
+        }
+        Ok(())
+    };
     let valid_issue_key = |s: &str| -> Result<(), String> {
         let Some((project, number)) = s.split_once('-') else {
             return Err("issue_key must be in PROJECT-NUMBER format".into());
@@ -503,6 +554,7 @@ fn resolve_target(
                 path: format!("/rest/api/3/issue/{issue_key}"),
                 body: RequestBody::None,
                 update: None,
+                resolve_ref: None,
             })
         }
         "jira_create_issue" => {
@@ -521,6 +573,7 @@ fn resolve_target(
                 path: "/rest/api/3/issue".into(),
                 body: RequestBody::json(args.clone()),
                 update: None,
+                resolve_ref: None,
             })
         }
         "jira_add_comment" => {
@@ -541,6 +594,7 @@ fn resolve_target(
                 path: format!("/rest/api/3/issue/{issue_key}/comment"),
                 body: RequestBody::json(json!({ "body": body })),
                 update: None,
+                resolve_ref: None,
             })
         }
         "confluence_get_page" => {
@@ -569,6 +623,7 @@ fn resolve_target(
                 path: format!("/wiki/api/v2/pages/{page_id}?body-format=view"),
                 body: RequestBody::None,
                 update: None,
+                resolve_ref: None,
             })
         }
         "confluence_create_page" => {
@@ -630,6 +685,7 @@ fn resolve_target(
                 path: "/wiki/api/v2/pages".into(),
                 body: RequestBody::json(payload),
                 update: None,
+                resolve_ref: None,
             })
         }
         "confluence_update_page" => {
@@ -698,7 +754,125 @@ fn resolve_target(
                     "body": body_value
                 })),
                 update: None,
+                resolve_ref: None,
             })
+        }
+        "bitbucket_list_branches" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::GET,
+                path: format!("/repositories/{workspace}/{repo_slug}/refs/branches"),
+                body: RequestBody::None,
+                update: None,
+                resolve_ref: None,
+            })
+        }
+        "bitbucket_list_directory" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let sub_path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !sub_path.is_empty() {
+                valid_repo_path(&sub_path)?;
+            }
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            let repo_prefix = format!("/repositories/{workspace}/{repo_slug}");
+            if let Some(ref_name) = args.get("ref").and_then(|v| v.as_str()) {
+                valid_ref_name(ref_name)?;
+                let path = build_bitbucket_src_path(&repo_prefix, ref_name, &sub_path, true);
+                Ok(ToolTarget {
+                    workspace: Some(workspace.into()),
+                    repo: Some(repo_slug.into()),
+                    project: None,
+                    space: None,
+                    method: Method::GET,
+                    path,
+                    body: RequestBody::None,
+                    update: None,
+                    resolve_ref: None,
+                })
+            } else {
+                Ok(ToolTarget {
+                    workspace: Some(workspace.into()),
+                    repo: Some(repo_slug.into()),
+                    project: None,
+                    space: None,
+                    method: Method::GET,
+                    path: String::new(),
+                    body: RequestBody::None,
+                    update: None,
+                    resolve_ref: Some(ResolveRef {
+                        repo_prefix,
+                        sub_path,
+                        trailing_slash: true,
+                    }),
+                })
+            }
+        }
+        "bitbucket_get_file_content" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let sub_path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or("missing path")?
+                .to_string();
+            valid_repo_path(&sub_path)?;
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            let repo_prefix = format!("/repositories/{workspace}/{repo_slug}");
+            if let Some(ref_name) = args.get("ref").and_then(|v| v.as_str()) {
+                valid_ref_name(ref_name)?;
+                let path = build_bitbucket_src_path(&repo_prefix, ref_name, &sub_path, false);
+                Ok(ToolTarget {
+                    workspace: Some(workspace.into()),
+                    repo: Some(repo_slug.into()),
+                    project: None,
+                    space: None,
+                    method: Method::GET,
+                    path,
+                    body: RequestBody::None,
+                    update: None,
+                    resolve_ref: None,
+                })
+            } else {
+                Ok(ToolTarget {
+                    workspace: Some(workspace.into()),
+                    repo: Some(repo_slug.into()),
+                    project: None,
+                    space: None,
+                    method: Method::GET,
+                    path: String::new(),
+                    body: RequestBody::None,
+                    update: None,
+                    resolve_ref: Some(ResolveRef {
+                        repo_prefix,
+                        sub_path,
+                        trailing_slash: false,
+                    }),
+                })
+            }
         }
         "bitbucket_get_repo" => {
             let args = args.ok_or("missing arguments")?;
@@ -717,6 +891,7 @@ fn resolve_target(
                 path: format!("/repositories/{workspace}/{repo_slug}"),
                 body: RequestBody::None,
                 update: None,
+                resolve_ref: None,
             })
         }
         "bitbucket_get_pull_request" => {
@@ -745,6 +920,7 @@ fn resolve_target(
                 ),
                 body: RequestBody::None,
                 update: None,
+                resolve_ref: None,
             })
         }
         "bitbucket_create_branch" => {
@@ -777,6 +953,7 @@ fn resolve_target(
                     "target": { "hash": target_hash }
                 })),
                 update: None,
+                resolve_ref: None,
             })
         }
         "bitbucket_create_commit" => {
@@ -836,6 +1013,7 @@ fn resolve_target(
                 path: format!("/repositories/{workspace}/{repo_slug}/src"),
                 body: RequestBody::form(form_fields),
                 update: None,
+                resolve_ref: None,
             })
         }
         "bitbucket_create_pull_request" => {
@@ -880,6 +1058,7 @@ fn resolve_target(
                 path: format!("/repositories/{workspace}/{repo_slug}/pullrequests"),
                 body: RequestBody::json(body),
                 update: None,
+                resolve_ref: None,
             })
         }
         "bitbucket_create_repo" => {
@@ -903,6 +1082,7 @@ fn resolve_target(
                 path: format!("/repositories/{workspace}/{repo_slug}"),
                 body: RequestBody::json(json!({ "is_private": is_private })),
                 update: None,
+                resolve_ref: None,
             })
         }
         "jira_update_issue" => {
@@ -945,6 +1125,7 @@ fn resolve_target(
                     assignee,
                     description_append,
                 }),
+                resolve_ref: None,
             })
         }
         "jira_get_transitions" => {
@@ -964,6 +1145,7 @@ fn resolve_target(
                 path: format!("/rest/api/3/issue/{issue_key}/transitions"),
                 body: RequestBody::None,
                 update: None,
+                resolve_ref: None,
             })
         }
         "jira_transition_issue" => {
@@ -990,10 +1172,44 @@ fn resolve_target(
                 path: format!("/rest/api/3/issue/{issue_key}/transitions"),
                 body: RequestBody::json(json!({ "transition": { "id": transition_id } })),
                 update: None,
+                resolve_ref: None,
             })
         }
         _ => Err("unsupported tool".into()),
     }
+}
+
+/// Percent-encode a single URL path segment using the `url` crate's rules.
+fn encode_path_segment(segment: &str) -> String {
+    let mut url = reqwest::Url::parse("https://x.com").expect("static base URL");
+    url.path_segments_mut()
+        .expect("mutable path segments")
+        .push(segment);
+    url.path().trim_start_matches('/').to_string()
+}
+
+/// Build the Bitbucket Source API path `/repositories/{workspace}/{repo}/src/{ref}/{path}`,
+/// encoding each path segment individually.
+fn build_bitbucket_src_path(
+    repo_prefix: &str,
+    ref_name: &str,
+    sub_path: &str,
+    trailing_slash: bool,
+) -> String {
+    let mut path = format!("{}/src/{}", repo_prefix, encode_path_segment(ref_name));
+    let encoded_sub: Vec<String> = sub_path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(encode_path_segment)
+        .collect();
+    if !encoded_sub.is_empty() {
+        path.push('/');
+        path.push_str(&encoded_sub.join("/"));
+    }
+    if trailing_slash {
+        path.push('/');
+    }
+    path
 }
 
 /// Build the upstream PUT body for `jira_update_issue`.
@@ -1046,6 +1262,53 @@ async fn prepare_jira_update_body<C: UpstreamClient>(
         fields.insert("description".into(), merged);
     }
     Ok(RequestBody::json(json!({ "fields": fields })))
+}
+
+/// Resolve the repository default branch and build the final Source API path
+/// for `bitbucket_list_directory` and `bitbucket_get_file_content`.
+async fn resolve_bitbucket_default_branch<C: UpstreamClient>(
+    client: &C,
+    resolve: ResolveRef,
+) -> Result<String, (StatusCode, String)> {
+    let repo_request = client
+        .build_request(Method::GET, &resolve.repo_prefix, RequestBody::None)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let repo_response = client.execute(repo_request).await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("upstream GET failed: {}", e),
+        )
+    })?;
+    if !repo_response.status().is_success() {
+        return Err((
+            StatusCode::from_u16(repo_response.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY),
+            format!("upstream GET returned {}", repo_response.status()),
+        ));
+    }
+    let repo: Value = repo_response.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to parse upstream GET response: {}", e),
+        )
+    })?;
+    let branch = repo
+        .get("mainbranch")
+        .and_then(|m| m.get("name"))
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "missing mainbranch.name in repository response".to_string(),
+            )
+        })?;
+    Ok(build_bitbucket_src_path(
+        &resolve.repo_prefix,
+        branch,
+        &resolve.sub_path,
+        resolve.trailing_slash,
+    ))
 }
 
 /// Append `text` to an existing ADF description as a new `panel` node titled
@@ -1218,6 +1481,9 @@ mod tests {
                 tools: vec![
                     "bitbucket_get_repo".into(),
                     "bitbucket_get_pull_request".into(),
+                    "bitbucket_list_branches".into(),
+                    "bitbucket_list_directory".into(),
+                    "bitbucket_get_file_content".into(),
                 ],
                 projects: vec![],
                 spaces: vec![],
@@ -3013,7 +3279,8 @@ mod tests {
             Json(json!({
                 "full_name": format!("{workspace}/{repo}"),
                 "name": repo,
-                "workspace": { "slug": workspace }
+                "workspace": { "slug": workspace },
+                "mainbranch": { "name": "main" }
             }))
         };
 
@@ -3054,6 +3321,48 @@ mod tests {
             }))
         };
 
+        let list_branches_handler = |State(s): State<MockState>,
+                                     Path((_workspace, _repo)): Path<(String, String)>,
+                                     headers: HeaderMap| async move {
+            s.headers.lock().unwrap().push(headers);
+            Json(json!({
+                "values": [
+                    {
+                        "name": "main",
+                        "target": { "hash": "abc123" }
+                    },
+                    {
+                        "name": "feature/x",
+                        "target": { "hash": "def456" }
+                    }
+                ]
+            }))
+        };
+
+        let src_handler = |State(s): State<MockState>,
+                           Path((workspace, repo, tail)): Path<(String, String, String)>,
+                           headers: HeaderMap| async move {
+            s.headers.lock().unwrap().push(headers);
+            let (ref_name, sub_path) = tail.split_once('/').unwrap_or((&tail, ""));
+            if sub_path.is_empty() || sub_path.ends_with('/') {
+                let trimmed = sub_path.trim_end_matches('/');
+                Json(json!({
+                    "values": [
+                        { "type": "commit_file", "path": format!("{}/README.md", trimmed).trim_start_matches('/') },
+                        { "type": "commit_directory", "path": format!("{}/src", trimmed).trim_start_matches('/') }
+                    ],
+                    "size": 2,
+                    "page": 1,
+                    "pagelen": 10
+                }))
+            } else {
+                Json(json!(format!(
+                    "content of {}/{} in {}/{}",
+                    ref_name, sub_path, workspace, repo
+                )))
+            }
+        };
+
         let create_pr_handler = |State(s): State<MockState>,
                                  Path((workspace, repo)): Path<(String, String)>,
                                  headers: HeaderMap,
@@ -3090,7 +3399,7 @@ mod tests {
             )
             .route(
                 "/repositories/{workspace}/{repo}/refs/branches",
-                post(create_branch_handler),
+                get(list_branches_handler).post(create_branch_handler),
             )
             .route(
                 "/repositories/{workspace}/{repo}/pullrequests",
@@ -3099,6 +3408,10 @@ mod tests {
             .route(
                 "/repositories/{workspace}/{repo}/src",
                 post(create_commit_handler),
+            )
+            .route(
+                "/repositories/{workspace}/{repo}/src/{*tail}",
+                get(src_handler),
             )
             .with_state(state);
 
@@ -3584,6 +3897,333 @@ mod tests {
         assert_eq!(upstream["title"], "PR title");
 
         std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_list_branches_allowed_and_strips_headers() {
+        let (port, captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_list_branches",
+                json!({"repo_slug": "my-repo"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        let values = json["result"]["values"].as_array().unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["name"], "main");
+        assert_eq!(values[0]["target"]["hash"], "abc123");
+
+        let upstream_headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            upstream_headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer test-token"
+        );
+        assert!(!upstream_headers.contains_key("x-atlapool-key"));
+        assert!(!upstream_headers.contains_key("cookie"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_list_directory_with_ref() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_list_directory",
+                json!({"repo_slug": "my-repo", "ref": "main"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        let values = json["result"]["values"].as_array().unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["path"], "README.md");
+        assert_eq!(values[1]["path"], "src");
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_list_directory_resolves_default_branch() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_list_directory",
+                json!({"repo_slug": "my-repo", "path": "src"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        let values = json["result"]["values"].as_array().unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["path"], "src/README.md");
+        assert_eq!(values[1]["path"], "src/src");
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_file_content_with_ref() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_file_content",
+                json!({"repo_slug": "my-repo", "ref": "main", "path": "README.md"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["result"]
+            .as_str()
+            .unwrap()
+            .contains("content of main/README.md"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_file_content_resolves_default_branch() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_file_content",
+                json!({"repo_slug": "my-repo", "path": "README.md"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["result"]
+            .as_str()
+            .unwrap()
+            .contains("content of main/README.md"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_list_directory_rejects_path_traversal() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["*".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_list_directory",
+                json!({"repo_slug": "my-repo", "path": "../secret"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_file_content_rejects_path_traversal() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["*".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_file_content",
+                json!({"repo_slug": "my-repo", "path": "foo/../secret.txt"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_list_directory_rejects_ref_with_slash() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["*".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_list_directory",
+                json!({"repo_slug": "my-repo", "ref": "feature/x"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_list_directory_rejects_ref_dotdot() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["*".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_list_directory",
+                json!({"repo_slug": "my-repo", "ref": ".."}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
