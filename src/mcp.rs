@@ -1865,6 +1865,15 @@ mod tests {
     }
 
     fn build_jsonrpc_request(method: &str, params: Value, key: Option<&str>) -> Request<Body> {
+        build_jsonrpc_request_with_headers(method, params, key, &[])
+    }
+
+    fn build_jsonrpc_request_with_headers(
+        method: &str,
+        params: Value,
+        key: Option<&str>,
+        extra_headers: &[(&str, &str)],
+    ) -> Request<Body> {
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -1878,12 +1887,32 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json");
 
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+
         if let Some(k) = key {
             builder = builder.header("X-Atlapool-Key", k);
         }
         // A sensitive header that must never reach the upstream Jira server.
         builder = builder.header("cookie", "session=bad");
         builder.body(Body::from(body)).unwrap()
+    }
+
+    fn build_request_with_protocol_version(
+        tool: &str,
+        args: Value,
+        key: Option<&str>,
+    ) -> Request<Body> {
+        build_jsonrpc_request_with_headers(
+            "tools/call",
+            json!({
+                "name": tool,
+                "arguments": args
+            }),
+            key,
+            &[("mcp-protocol-version", "2024-11-05")],
+        )
     }
 
     async fn mock_jira_server() -> (u16, Arc<Mutex<Vec<HeaderMap>>>) {
@@ -1992,6 +2021,26 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (port, captured)
+    }
+
+    async fn mock_jira_server_404() -> u16 {
+        let get_handler = |Path(_): Path<String>, headers: HeaderMap| async move {
+            let _ = headers; // silence unused variable warning in tests
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "errorMessages": ["Issue does not exist"],
+                    "errors": {}
+                })),
+            )
+        };
+
+        let app = Router::new().route("/rest/api/3/issue/{key}", get(get_handler));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
     }
 
     async fn mock_confluence_server() -> (u16, Arc<Mutex<Vec<HeaderMap>>>) {
@@ -2577,6 +2626,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_get_issue_with_protocol_version_upstream_404_returns_calltool_error() {
+        let port = mock_jira_server_404().await;
+        let mut config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        config.agents[0].tools = vec!["jira_get_issue".into()];
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request_with_protocol_version(
+                "jira_get_issue",
+                json!({"issue_key": "PROJ-999"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        assert_eq!(
+            json["result"]["structuredContent"]["errorMessages"][0],
+            "Issue does not exist"
+        );
     }
 
     #[tokio::test]
