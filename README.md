@@ -744,10 +744,9 @@ Choose one of the following authentication methods:
    > An OAuth consumer works on free plans and is the only no-cost way to obtain
    > credentials that are not tied to an individual user account.
 
-If you are migrating from the earlier E2E setup, `atlapool_bitbucket_token` may
-be either an app password or a Workspace/Project access token; both work in
-`[bitbucket].token`. Ask your Bitbucket admin which one was provisioned if you
-need to rotate or replace it.
+If you are migrating from the earlier E2E setup, `atlapool_bitbucket_token` was a
+**Workspace access token**. Workspace access tokens are a Bitbucket Premium feature
+and are tied to the workspace rather than an individual user account.
 
 Bitbucket calls are sent to `https://api.bitbucket.org/2.0` (or `bitbucket.base_url`
 if overridden):
