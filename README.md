@@ -311,6 +311,11 @@ Then use the same `curl` commands as above.
 - `tools/list` — returns the agent's allowed tools with `inputSchema`.
 - `tools/call` — invokes a tool with arguments.
 
+`tools/call` returns the upstream JSON directly by default. When the request
+includes the `Mcp-Protocol-Version` header (as standard MCP clients such as
+`rmcp` do after initialization), the upstream JSON is wrapped in a standard
+`CallToolResult` with `content`, `isError: false`, and `structuredContent`.
+
 Example `tools/call` envelope:
 
 ```json
