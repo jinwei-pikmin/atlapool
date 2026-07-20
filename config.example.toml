@@ -71,11 +71,13 @@ port = 8080
 # token_url = "https://bitbucket.org/site/oauth2/access_token"  # optional
 
 [mcp]
-# Reserved fields. The server currently does not gate the /mcp endpoint on
-# `enabled` nor apply a global `enable_writes` default. The /health and /stats
-# endpoints are always available, and write-gating is controlled per-agent via
-# `agents.enable_writes` below.
+# enabled: when false, the /mcp endpoint returns 503 Service Unavailable.
+# /health and /stats are always available.
 enabled = false
+
+# enable_writes: global default for the write-gate. Per-agent `enable_writes`
+# takes precedence when set (true or false). If an agent leaves `enable_writes`
+# unset, this value is used.
 # enable_writes = false
 
 [audit]
@@ -122,8 +124,10 @@ enabled = false
 #          "bitbucket_create_repo", "bitbucket_create_branch",
 #          "bitbucket_create_commit", "bitbucket_create_pull_request"]
 #
-# enable_writes: must be true for any non-read tool (jira_create_issue, jira_add_comment,
+# enable_writes: when true, the agent may call write tools. If omitted, the global
+# [mcp] enable_writes value is used. Setting this explicitly to false overrides a
+# global true. Write tools: jira_create_issue, jira_add_comment,
 # confluence_create_page, confluence_update_page, bitbucket_create_repo,
-# bitbucket_create_branch, bitbucket_create_commit, bitbucket_create_pull_request).
+# bitbucket_create_branch, bitbucket_create_commit, bitbucket_create_pull_request.
 # Read tools such as jira_get_issue, confluence_get_page, bitbucket_get_repo work when false.
 # enable_writes = false

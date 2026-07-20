@@ -58,6 +58,14 @@ pub async fn mcp_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    if !state.config.mcp.enabled {
+        return mcp_error(
+            None,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "mcp endpoint disabled",
+        );
+    }
+
     let key = headers
         .get(MCP_KEY_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -148,9 +156,13 @@ pub async fn mcp_handler(
     }
 
     // Write gate: conservative classification. Anything that is not a read prefix
-    // is treated as a write and requires enable_writes=true on the agent.
+    // is treated as a write. Per-agent enable_writes takes precedence over the
+    // global [mcp] enable_writes default.
     let is_write = agents::classify_tool(&params.name) == agents::ToolKind::Write;
-    if is_write && !agent.enable_writes {
+    let writes_enabled = agent
+        .enable_writes
+        .unwrap_or(state.config.mcp.enable_writes);
+    if is_write && !writes_enabled {
         tracing::warn!(
             agent_id = %agent.id,
             tool = %params.name,
@@ -889,7 +901,10 @@ mod tests {
                 token: Some(SecretString::new("test-token")),
             }),
             bitbucket: None,
-            mcp: McpConfig::default(),
+            mcp: McpConfig {
+                enabled: true,
+                ..Default::default()
+            },
             audit: AuditConfig { path: audit_path },
             agents: vec![AgentConfig {
                 id: "demo".into(),
@@ -903,7 +918,7 @@ mod tests {
                 spaces: vec![],
                 bitbucket_workspaces: vec![],
                 bitbucket_repos: vec![],
-                enable_writes,
+                enable_writes: Some(enable_writes),
             }],
         }
     }
@@ -923,7 +938,10 @@ mod tests {
                 token: Some(SecretString::new("test-token")),
             }),
             bitbucket: None,
-            mcp: McpConfig::default(),
+            mcp: McpConfig {
+                enabled: true,
+                ..Default::default()
+            },
             audit: AuditConfig { path: audit_path },
             agents: vec![AgentConfig {
                 id: "demo".into(),
@@ -937,7 +955,7 @@ mod tests {
                 spaces,
                 bitbucket_workspaces: vec![],
                 bitbucket_repos: vec![],
-                enable_writes,
+                enable_writes: Some(enable_writes),
             }],
         }
     }
@@ -957,7 +975,10 @@ mod tests {
                 token: Some(SecretString::new("test-token")),
                 oauth: None,
             }),
-            mcp: McpConfig::default(),
+            mcp: McpConfig {
+                enabled: true,
+                ..Default::default()
+            },
             audit: AuditConfig { path: audit_path },
             agents: vec![AgentConfig {
                 id: "demo".into(),
@@ -970,7 +991,7 @@ mod tests {
                 spaces: vec![],
                 bitbucket_workspaces: workspaces,
                 bitbucket_repos: repos,
-                enable_writes: false,
+                enable_writes: None,
             }],
         }
     }
@@ -1161,6 +1182,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mcp_disabled_returns_503() {
+        let mut config = test_config("http://localhost:0".into(), false, None);
+        config.mcp.enabled = false;
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_get_issue",
+                json!({"issue_key":"PROJ-123"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("mcp endpoint disabled"));
+    }
+
+    #[tokio::test]
+    async fn mcp_global_enable_writes_allows_write_when_agent_unset() {
+        let (port, _captured) = mock_jira_server().await;
+        let mut config = test_config(
+            format!("http://127.0.0.1:{}", port),
+            false, // per-agent unset
+            Some(temp_audit_path()),
+        );
+        config.mcp.enable_writes = true;
+        config.agents[0].enable_writes = None;
+
+        let audit_path = config.audit.path.clone().unwrap();
+        let audit = Some(AuditLog::new(audit_path.clone()));
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_create_issue",
+                json!({"project":"PROJ","summary":"stub"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let content = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(content.contains("\"result\":\"attempt\""));
+        assert!(content.contains("\"result\":\"success\""));
+    }
+
+    #[tokio::test]
+    async fn mcp_agent_enable_writes_false_overrides_global_true() {
+        let (port, _captured) = mock_jira_server().await;
+        let mut config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        config.mcp.enable_writes = true;
+        config.agents[0].enable_writes = Some(false);
+
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_create_issue",
+                json!({"project":"PROJ","summary":"stub"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -2578,7 +2693,7 @@ mod tests {
             vec!["WORK".into()],
             vec!["*".into()],
         );
-        config.agents[0].enable_writes = enable_writes;
+        config.agents[0].enable_writes = Some(enable_writes);
         config.agents[0].tools = tools;
         (config, audit_path)
     }
