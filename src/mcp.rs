@@ -39,6 +39,18 @@ struct ToolTarget {
     method: Method,
     path: String,
     body: RequestBody,
+    /// Staging fields for `jira_update_issue`; the final PUT body is built
+    /// after authorization and write-gate, because `description_append` may
+    /// require fetching the existing ADF first.
+    update: Option<UpdateIssueFields>,
+}
+
+#[derive(Default)]
+struct UpdateIssueFields {
+    issue_key: String,
+    summary: Option<String>,
+    assignee: Option<String>,
+    description_append: Option<String>,
 }
 
 impl ToolTarget {
@@ -131,7 +143,7 @@ pub async fn mcp_handler(
         .bitbucket
         .as_ref()
         .and_then(|c| c.workspace.as_deref());
-    let target = match resolve_target(&params.name, params.arguments.as_ref(), workspace) {
+    let mut target = match resolve_target(&params.name, params.arguments.as_ref(), workspace) {
         Ok(t) => t,
         Err(msg) => return mcp_error(request.id, StatusCode::BAD_REQUEST, &msg),
     };
@@ -261,6 +273,31 @@ pub async fn mcp_handler(
                 "upstream not configured",
             );
         };
+
+        // jira_update_issue may need to fetch the existing description before
+        // building the upstream PUT body. The read is safe to issue now because
+        // authorization and the write-gate have already passed.
+        if let Some(update) = target.update.take() {
+            match prepare_jira_update_body(jira, update).await {
+                Ok(body) => target.body = body,
+                Err((status, message)) => {
+                    if let Some(ref audit) = audit {
+                        audit
+                            .record_result(
+                                &agent.id,
+                                &params.name,
+                                &target.target_string(),
+                                false,
+                                Some(status.as_u16()),
+                                Some(message.as_str()),
+                            )
+                            .await;
+                    }
+                    return mcp_error(request.id, status, &message);
+                }
+            }
+        }
+
         forward(
             jira,
             audit,
@@ -465,6 +502,7 @@ fn resolve_target(
                 method: Method::GET,
                 path: format!("/rest/api/3/issue/{issue_key}"),
                 body: RequestBody::None,
+                update: None,
             })
         }
         "jira_create_issue" => {
@@ -482,6 +520,7 @@ fn resolve_target(
                 method: Method::POST,
                 path: "/rest/api/3/issue".into(),
                 body: RequestBody::json(args.clone()),
+                update: None,
             })
         }
         "jira_add_comment" => {
@@ -501,6 +540,7 @@ fn resolve_target(
                 method: Method::POST,
                 path: format!("/rest/api/3/issue/{issue_key}/comment"),
                 body: RequestBody::json(json!({ "body": body })),
+                update: None,
             })
         }
         "confluence_get_page" => {
@@ -528,6 +568,7 @@ fn resolve_target(
                 method: Method::GET,
                 path: format!("/wiki/api/v2/pages/{page_id}?body-format=view"),
                 body: RequestBody::None,
+                update: None,
             })
         }
         "confluence_create_page" => {
@@ -588,6 +629,7 @@ fn resolve_target(
                 method: Method::POST,
                 path: "/wiki/api/v2/pages".into(),
                 body: RequestBody::json(payload),
+                update: None,
             })
         }
         "confluence_update_page" => {
@@ -655,6 +697,7 @@ fn resolve_target(
                     "version": { "number": version },
                     "body": body_value
                 })),
+                update: None,
             })
         }
         "bitbucket_get_repo" => {
@@ -673,6 +716,7 @@ fn resolve_target(
                 method: Method::GET,
                 path: format!("/repositories/{workspace}/{repo_slug}"),
                 body: RequestBody::None,
+                update: None,
             })
         }
         "bitbucket_get_pull_request" => {
@@ -700,6 +744,7 @@ fn resolve_target(
                     "/repositories/{workspace}/{repo_slug}/pullrequests/{pull_request_id}"
                 ),
                 body: RequestBody::None,
+                update: None,
             })
         }
         "bitbucket_create_branch" => {
@@ -731,6 +776,7 @@ fn resolve_target(
                     "name": branch_name,
                     "target": { "hash": target_hash }
                 })),
+                update: None,
             })
         }
         "bitbucket_create_commit" => {
@@ -789,6 +835,7 @@ fn resolve_target(
                 method: Method::POST,
                 path: format!("/repositories/{workspace}/{repo_slug}/src"),
                 body: RequestBody::form(form_fields),
+                update: None,
             })
         }
         "bitbucket_create_pull_request" => {
@@ -832,6 +879,7 @@ fn resolve_target(
                 method: Method::POST,
                 path: format!("/repositories/{workspace}/{repo_slug}/pullrequests"),
                 body: RequestBody::json(body),
+                update: None,
             })
         }
         "bitbucket_create_repo" => {
@@ -854,10 +902,191 @@ fn resolve_target(
                 method: Method::POST,
                 path: format!("/repositories/{workspace}/{repo_slug}"),
                 body: RequestBody::json(json!({ "is_private": is_private })),
+                update: None,
+            })
+        }
+        "jira_update_issue" => {
+            let args = args.ok_or("missing arguments")?;
+            let issue_key = args
+                .get("issue_key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing issue_key")?;
+            valid_issue_key(issue_key)?;
+            let project = issue_key.split_once('-').map(|(p, _)| p.to_string());
+            let summary = args
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let assignee = args
+                .get("assignee")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let description_append = args
+                .get("description_append")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            if summary.is_none() && assignee.is_none() && description_append.is_none() {
+                return Err(
+                    "at least one of summary, assignee, or description_append must be provided"
+                        .into(),
+                );
+            }
+            Ok(ToolTarget {
+                workspace: None,
+                repo: None,
+                project,
+                space: None,
+                method: Method::PUT,
+                path: format!("/rest/api/3/issue/{issue_key}"),
+                body: RequestBody::None,
+                update: Some(UpdateIssueFields {
+                    issue_key: issue_key.to_string(),
+                    summary,
+                    assignee,
+                    description_append,
+                }),
+            })
+        }
+        "jira_get_transitions" => {
+            let args = args.ok_or("missing arguments")?;
+            let issue_key = args
+                .get("issue_key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing issue_key")?;
+            valid_issue_key(issue_key)?;
+            let project = issue_key.split_once('-').map(|(p, _)| p.to_string());
+            Ok(ToolTarget {
+                workspace: None,
+                repo: None,
+                project,
+                space: None,
+                method: Method::GET,
+                path: format!("/rest/api/3/issue/{issue_key}/transitions"),
+                body: RequestBody::None,
+                update: None,
+            })
+        }
+        "jira_transition_issue" => {
+            let args = args.ok_or("missing arguments")?;
+            let issue_key = args
+                .get("issue_key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing issue_key")?;
+            valid_issue_key(issue_key)?;
+            let project = issue_key.split_once('-').map(|(p, _)| p.to_string());
+            let transition_id = args
+                .get("transition_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing transition_id")?;
+            if transition_id.is_empty() || !transition_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err("transition_id must be a non-empty numeric id".into());
+            }
+            Ok(ToolTarget {
+                workspace: None,
+                repo: None,
+                project,
+                space: None,
+                method: Method::POST,
+                path: format!("/rest/api/3/issue/{issue_key}/transitions"),
+                body: RequestBody::json(json!({ "transition": { "id": transition_id } })),
+                update: None,
             })
         }
         _ => Err("unsupported tool".into()),
     }
+}
+
+/// Build the upstream PUT body for `jira_update_issue`.
+///
+/// `summary` and `assignee` are set directly. For `description_append`, the
+/// existing issue description is fetched, the new content is appended as an
+/// ADF `panel`, and the merged ADF is included in the payload.
+async fn prepare_jira_update_body<C: UpstreamClient>(
+    client: &C,
+    update: UpdateIssueFields,
+) -> Result<RequestBody, (StatusCode, String)> {
+    let mut fields = serde_json::Map::new();
+    if let Some(summary) = update.summary {
+        fields.insert("summary".into(), Value::String(summary));
+    }
+    if let Some(assignee) = update.assignee {
+        fields.insert("assignee".into(), json!({ "accountId": assignee }));
+    }
+    if let Some(append) = update.description_append {
+        let get_request = client
+            .build_request(
+                Method::GET,
+                &format!("/rest/api/3/issue/{}?fields=description", update.issue_key),
+                RequestBody::None,
+            )
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        let get_response = client.execute(get_request).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("upstream GET failed: {}", e),
+            )
+        })?;
+        if !get_response.status().is_success() {
+            return Err((
+                StatusCode::from_u16(get_response.status().as_u16())
+                    .unwrap_or(StatusCode::BAD_GATEWAY),
+                format!("upstream GET returned {}", get_response.status()),
+            ));
+        }
+        let issue: Value = get_response.json().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("failed to parse upstream GET response: {}", e),
+            )
+        })?;
+        let existing = issue.get("fields").and_then(|f| f.get("description"));
+        let merged =
+            merge_adf_description(existing, &append).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        fields.insert("description".into(), merged);
+    }
+    Ok(RequestBody::json(json!({ "fields": fields })))
+}
+
+/// Append `text` to an existing ADF description as a new `panel` node titled
+/// "📋 分析補充".
+fn merge_adf_description(existing: Option<&Value>, text: &str) -> Result<Value, String> {
+    let mut doc = match existing {
+        Some(Value::Null) | None => {
+            json!({ "type": "doc", "version": 1, "content": [] })
+        }
+        Some(Value::Object(_)) => existing.cloned().unwrap(),
+        Some(_) => return Err("existing description is not a valid ADF object".into()),
+    };
+
+    if !doc.get("type").map(|v| v.is_string()).unwrap_or(false) {
+        doc["type"] = json!("doc");
+    }
+    if !doc.get("content").map(|v| v.is_array()).unwrap_or(false) {
+        doc["content"] = json!([]);
+    }
+
+    let panel = json!({
+        "type": "panel",
+        "attrs": { "panelType": "info" },
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [{ "type": "text", "text": "📋 分析補充" }]
+            },
+            {
+                "type": "paragraph",
+                "content": [{ "type": "text", "text": text }]
+            }
+        ]
+    });
+
+    let content = doc
+        .get_mut("content")
+        .and_then(|v| v.as_array_mut())
+        .ok_or("ADF content is not an array")?;
+    content.push(panel);
+    Ok(doc)
 }
 
 #[cfg(test)]
@@ -913,6 +1142,9 @@ mod tests {
                     "jira_get_issue".into(),
                     "jira_create_issue".into(),
                     "jira_add_comment".into(),
+                    "jira_update_issue".into(),
+                    "jira_get_transitions".into(),
+                    "jira_transition_issue".into(),
                 ],
                 projects: vec!["PROJ".into()],
                 spaces: vec![],
@@ -1035,7 +1267,22 @@ mod tests {
         let get_handler =
             |State(s): State<MockState>, Path(_): Path<String>, headers: HeaderMap| async move {
                 s.headers.lock().unwrap().push(headers);
-                Json(json!({"id":"PROJ-123","key":"PROJ-123"}))
+                Json(json!({
+                    "id": "10000",
+                    "key": "PROJ-123",
+                    "fields": {
+                        "description": {
+                            "type": "doc",
+                            "version": 1,
+                            "content": [
+                                {
+                                    "type": "paragraph",
+                                    "content": [{ "type": "text", "text": "original" }]
+                                }
+                            ]
+                        }
+                    }
+                }))
             };
 
         let post_handler = |State(s): State<MockState>, headers: HeaderMap, body: Bytes| async move {
@@ -1046,6 +1293,39 @@ mod tests {
                 "id": "10000",
                 "key": "PROJ-123",
                 "fields": { "project": payload }
+            }))
+        };
+
+        let update_handler = |State(s): State<MockState>,
+                              Path(_): Path<String>,
+                              headers: HeaderMap,
+                              body: Bytes| async move {
+            s.headers.lock().unwrap().push(headers);
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_default();
+            Json(payload)
+        };
+
+        let get_transitions_handler =
+            |State(s): State<MockState>, Path(_): Path<String>, headers: HeaderMap| async move {
+                s.headers.lock().unwrap().push(headers);
+                Json(json!({
+                    "transitions": [
+                        { "id": "1", "name": "To Do" },
+                        { "id": "2", "name": "In Progress" }
+                    ]
+                }))
+            };
+
+        let do_transition_handler = |State(s): State<MockState>,
+                                     Path(_): Path<String>,
+                                     headers: HeaderMap,
+                                     body: Bytes| async move {
+            s.headers.lock().unwrap().push(headers);
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_default();
+            Json(json!({
+                "id": "10000",
+                "key": "PROJ-123",
+                "transition": payload
             }))
         };
 
@@ -1063,9 +1343,16 @@ mod tests {
         };
 
         let app = Router::new()
-            .route("/rest/api/3/issue/{key}", get(get_handler))
+            .route(
+                "/rest/api/3/issue/{key}",
+                get(get_handler).put(update_handler),
+            )
             .route("/rest/api/3/issue", post(post_handler))
             .route("/rest/api/3/issue/{key}/comment", post(comment_handler))
+            .route(
+                "/rest/api/3/issue/{key}/transitions",
+                get(get_transitions_handler).post(do_transition_handler),
+            )
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1754,6 +2041,392 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_update_issue_summary_only_writes_put_body() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            Some(temp_audit_path()),
+        );
+        let audit_path = config.audit.path.clone().unwrap();
+        let audit = Some(AuditLog::new(audit_path.clone()));
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_update_issue",
+                json!({"issue_key": "PROJ-123", "summary": "updated summary"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["fields"]["summary"], "updated summary");
+        assert!(json["result"]["fields"].get("assignee").is_none());
+        assert!(json["result"]["fields"].get("description").is_none());
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"result\":\"attempt\""));
+        assert!(lines[1].contains("\"result\":\"success\""));
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_update_issue_assignee_only_writes_put_body() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            Some(temp_audit_path()),
+        );
+        let audit_path = config.audit.path.clone().unwrap();
+        let audit = Some(AuditLog::new(audit_path.clone()));
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_update_issue",
+                json!({"issue_key": "PROJ-123", "assignee": "account-42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["result"]["fields"]["assignee"]["accountId"],
+            "account-42"
+        );
+        assert!(json["result"]["fields"].get("summary").is_none());
+        assert!(json["result"]["fields"].get("description").is_none());
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"result\":\"attempt\""));
+        assert!(lines[1].contains("\"result\":\"success\""));
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_update_issue_description_append_merges_adf() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            Some(temp_audit_path()),
+        );
+        let audit_path = config.audit.path.clone().unwrap();
+        let audit = Some(AuditLog::new(audit_path.clone()));
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_update_issue",
+                json!({"issue_key": "PROJ-123", "description_append": "additional note"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        let description = &json["result"]["fields"]["description"];
+        assert_eq!(description["type"], "doc");
+        let content = description["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        // Original paragraph is preserved.
+        assert_eq!(content[0]["content"][0]["text"], "original");
+        // New panel appended at the end.
+        assert_eq!(content[1]["type"], "panel");
+        assert_eq!(content[1]["attrs"]["panelType"], "info");
+        assert_eq!(
+            content[1]["content"][0]["content"][0]["text"],
+            "📋 分析補充"
+        );
+        assert_eq!(
+            content[1]["content"][1]["content"][0]["text"],
+            "additional note"
+        );
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"result\":\"attempt\""));
+        assert!(lines[1].contains("\"result\":\"success\""));
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_update_issue_rejects_empty_update() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), true, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_update_issue",
+                json!({"issue_key": "PROJ-123"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_update_issue_write_disabled_returns_403() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_update_issue",
+                json!({"issue_key": "PROJ-123", "summary": "updated"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_update_issue_forbidden_project_returns_403() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), true, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_update_issue",
+                json!({"issue_key": "OTHER-123", "summary": "updated"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_get_transitions_allowed_without_writes_enabled() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_get_transitions",
+                json!({"issue_key": "PROJ-123"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        let transitions = json["result"]["transitions"].as_array().unwrap();
+        assert_eq!(transitions.len(), 2);
+        assert_eq!(transitions[0]["id"], "1");
+        assert_eq!(transitions[0]["name"], "To Do");
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_transition_issue_allowed_and_audited() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            Some(temp_audit_path()),
+        );
+        let audit_path = config.audit.path.clone().unwrap();
+        let audit = Some(AuditLog::new(audit_path.clone()));
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_transition_issue",
+                json!({"issue_key": "PROJ-123", "transition_id": "2"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["transition"]["transition"]["id"], "2");
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"result\":\"attempt\""));
+        assert!(lines[1].contains("\"result\":\"success\""));
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_transition_issue_rejects_invalid_transition_id() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), true, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_transition_issue",
+                json!({"issue_key": "PROJ-123", "transition_id": "abc"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_transition_issue_write_disabled_returns_403() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_transition_issue",
+                json!({"issue_key": "PROJ-123", "transition_id": "2"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_transition_issue_forbidden_project_returns_403() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), true, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_transition_issue",
+                json!({"issue_key": "OTHER-123", "transition_id": "2"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
