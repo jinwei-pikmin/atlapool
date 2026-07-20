@@ -106,16 +106,20 @@ pub async fn mcp_handler(
         return mcp_error(request.id, StatusCode::BAD_REQUEST, "jsonrpc must be 2.0");
     }
 
-    match request.method.as_str() {
-        "initialize" => return initialize_handler(request.id).await,
-        "tools/list" | "tools/call" => {}
-        _ => {
-            return mcp_error(
-                request.id,
-                StatusCode::NOT_IMPLEMENTED,
-                "method not supported",
-            );
-        }
+    if request.method == "initialize" {
+        return initialize_handler(request.id).await;
+    }
+
+    if request.method.starts_with("notifications/") {
+        return (StatusCode::ACCEPTED, Json(json!({})));
+    }
+
+    if request.method != "tools/list" && request.method != "tools/call" {
+        return mcp_error(
+            request.id,
+            StatusCode::NOT_IMPLEMENTED,
+            "method not supported",
+        );
     }
 
     // tools/list and tools/call require a valid agent key.
@@ -4767,5 +4771,87 @@ mod tests {
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let call: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(call["result"]["key"], "PROJ-123");
+    }
+
+    #[tokio::test]
+    async fn mcp_real_client_initialize_list_call_flow() {
+        use mcp_protocol_sdk::client::McpClient;
+        use mcp_protocol_sdk::protocol::types::{JsonRpcRequest, RequestId};
+        use mcp_protocol_sdk::transport::traits::Transport;
+        use mcp_protocol_sdk::transport::{HttpClientTransport, TransportConfig};
+
+        let (port, _captured) = mock_jira_server().await;
+        let mut config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        config.agents[0].tools = vec!["jira_get_issue".into()];
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("x-atlapool-key".to_string(), "agent-key".to_string());
+
+        let transport_config = TransportConfig {
+            connect_timeout_ms: Some(5_000),
+            read_timeout_ms: Some(5_000),
+            write_timeout_ms: Some(5_000),
+            max_message_size: Some(1024 * 1024),
+            keep_alive_ms: None,
+            compression: false,
+            headers,
+        };
+
+        // Use the real MCP client library for initialize and tools/list.
+        let client_transport = HttpClientTransport::with_config(
+            format!("http://127.0.0.1:{}", server_port),
+            None::<String>,
+            transport_config.clone(),
+        )
+        .await
+        .unwrap();
+
+        let mut client = McpClient::new("atlapool-test-client".into(), "1.0.0".into());
+        let init = client.connect(client_transport).await.unwrap();
+        assert_eq!(init.server_info.name, "atlapool");
+
+        let tools = client.list_tools(None).await.unwrap();
+        assert_eq!(tools.tools.len(), 1);
+        assert_eq!(tools.tools[0].name, "jira_get_issue");
+
+        // Use a second transport from the same SDK to issue tools/call and verify
+        // the raw JSON-RPC result. This proves the protocol-compatible handshake
+        // discovered by the client can be followed by an actual tool invocation.
+        let mut call_transport = HttpClientTransport::with_config(
+            format!("http://127.0.0.1:{}", server_port),
+            None::<String>,
+            transport_config,
+        )
+        .await
+        .unwrap();
+
+        let request = JsonRpcRequest::new(
+            RequestId::from(2),
+            "tools/call".into(),
+            Some(serde_json::json!({
+                "name": "jira_get_issue",
+                "arguments": { "issue_key": "PROJ-123" }
+            })),
+        )
+        .unwrap();
+
+        let response = call_transport.send_request(request).await.unwrap();
+        let result = response.result.expect("expected result");
+        assert_eq!(result["key"], "PROJ-123");
     }
 }
