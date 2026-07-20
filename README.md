@@ -576,6 +576,58 @@ bitbucket_repos = ["my-repo"]
 enable_writes = true
 ```
 
+### Allowlists
+
+Each agent policy contains four target allowlists. A request is denied unless the
+called tool is in `tools` **and** every target dimension that the tool provides is
+allowed by the corresponding list.
+
+| Allowlist | Tool dimensions it gates | Examples |
+|---|---|---|
+| `projects` | Jira `project` / `issue_key` prefix | `["PROJ"]`, `["PROJ-A", "PROJ-B"]`, `["PROJ/*"]`, `["*"]` |
+| `spaces` | Confluence `space` key | `["SPACE"]`, `["SPACE", "DOCS"]`, `["SPACE/*"]`, `["*"]` |
+| `bitbucket_workspaces` | Bitbucket `workspace` slug | `["my-workspace"]`, `["work-a", "work-b"]`, `["*"]` |
+| `bitbucket_repos` | Bitbucket `repo_slug` | `["my-repo"]`, `["repo-a", "repo-b"]`, `["my-repo/*"]`, `["*"]` |
+
+#### Array and glob semantics
+
+- Each allowlist is an **array** and may contain multiple values.
+- Values are matched with a simple glob: `*` matches any character sequence,
+  including empty sequences and `/`. No other metacharacters are supported.
+  - `PROJ/*` matches `PROJ/123` and `PROJ/123/sub`.
+  - `PROJ*` matches `PROJ` and `PROJ-123` but **not** `OTHER`.
+  - `*` alone matches any value.
+
+#### Deny-by-default
+
+An **empty allowlist (`[]`) denies everything** for that dimension. It does *not*
+mean "allow all". If you want to allow all values in a dimension, use `["*"]`.
+
+#### AND-across-provided, OR-within
+
+For a single call, **each provided dimension must pass independently**:
+
+- If a tool call resolves a `workspace` and a `repo` (all Bitbucket tools do),
+  *both* `bitbucket_workspaces` and `bitbucket_repos` must contain a matching
+  pattern. `WORKSPACE-A/my-repo` is allowed only when the workspace allowlist
+  matches `WORKSPACE-A` **and** the repo allowlist matches `my-repo`.
+- If a tool call resolves only a `project` (e.g. `jira_get_issue`), only
+  `projects` is checked; the other allowlists are irrelevant.
+- Within one dimension, the value only has to match **one** pattern in the list
+  (OR semantics).
+
+Example: with
+
+```toml
+bitbucket_workspaces = ["my-workspace"]
+bitbucket_repos = ["my-repo", "other-repo"]
+```
+
+- `my-workspace/my-repo` is allowed.
+- `my-workspace/other-repo` is allowed.
+- `my-workspace/third-repo` is denied (repo does not match).
+- `other-workspace/my-repo` is denied (workspace does not match).
+
 Notes:
 
 - `base_url` is **not** required for Atlassian or Bitbucket; the defaults are the
@@ -584,9 +636,6 @@ Notes:
   set.
 - `bitbucket.workspace` is required for all Bitbucket tools and is injected by
   the server; the caller cannot override it.
-- `bitbucket_repos` is an array and supports glob `*`, just like `projects` and
-  `spaces`. You can list multiple repos (e.g. `["repo-a", "repo-b"]`) or allow
-  all repos in the workspace with `["*"]`.
 
 ### Secret reference formats
 
