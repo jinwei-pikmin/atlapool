@@ -65,14 +65,16 @@ injects the real token upstream, and audit-logs every write operation.
 
 Request flow for `POST /mcp`:
 
-1. Authenticate `X-Atlapool-Key` and load the matching agent policy.
-2. Resolve `tool`, `project`, `space`, `workspace`, and `repo` allowlists.
-3. For write tools: verify `enable_writes = true` and write a fail-closed
-   `attempt` audit record.
-4. Build the upstream request from an empty header set, inject the current
-   bearer token (static for Jira/Confluence; fetched or cached for Bitbucket),
-   and forward it.
-5. Return the upstream response to the caller.
+1. Parse the JSON-RPC 2.0 request.
+2. `initialize` does **not** require a key and returns protocol version,
+   capabilities, and server info.
+3. `tools/list` authenticates `X-Atlapool-Key` and returns the tools that the
+   agent is allowed to call, each with a JSON Schema `inputSchema`.
+4. `tools/call` authenticates, resolves `tool`, `project`, `space`, `workspace`,
+   and `repo` allowlists, applies the write-gate and audit for write tools,
+   builds the upstream request from an empty header set, injects the current
+   bearer token, and forwards it.
+5. Return the JSON-RPC response to the caller.
 
 ## Status
 
@@ -107,6 +109,34 @@ Replace `http://localhost:8080/mcp` with the deployed URL and set the header
 value to the agent key configured in `config.toml`.
 
 ### Raw HTTP
+
+Initialize (no key required):
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": { "protocolVersion": "2024-11-05" }
+  }'
+```
+
+List the tools this agent may call:
+
+```sh
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-Atlapool-Key: $ATLAPOOL_KEY_DEMO" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/list"
+  }'
+```
+
+Call a tool:
 
 ```sh
 curl -s -X POST http://localhost:8080/mcp \
@@ -275,7 +305,13 @@ Then use the same `curl` commands as above.
 
 ## MCP tools
 
-Call `POST /mcp` with a JSON-RPC 2.0 envelope:
+`/mcp` supports three JSON-RPC 2.0 methods:
+
+- `initialize` — handshake, no key required.
+- `tools/list` — returns the agent's allowed tools with `inputSchema`.
+- `tools/call` — invokes a tool with arguments.
+
+Example `tools/call` envelope:
 
 ```json
 {

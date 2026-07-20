@@ -10,6 +10,9 @@ All notable changes to this project will be documented in this file.
   - `bitbucket_list_branches`
   - `bitbucket_list_directory`
   - `bitbucket_get_file_content`
+- MCP protocol completeness:
+  - `initialize` handshake (no key required)
+  - `tools/list` returning per-agent allowed tools with JSON Schema `inputSchema`
 
 ## [0.1.0] - 2026-07-19
 
