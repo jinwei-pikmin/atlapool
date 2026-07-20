@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
 - MCP protocol completeness:
   - `initialize` handshake (no key required)
   - `tools/list` returning per-agent allowed tools with JSON Schema `inputSchema`
+  - `notifications/initialized` support on `POST /mcp/notify`
+  - Full `initialize` → `tools/list` → `tools/call` flow verified with the `mcp-protocol-sdk` client library
 
 ## [0.1.0] - 2026-07-19
 

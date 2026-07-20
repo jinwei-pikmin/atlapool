@@ -20,6 +20,12 @@ Issue #68 要求補齊這兩個方法，並為目前全部約 18 支工具定義
   - `capabilities`: `{ "tools": {} }`
   - `serverInfo`: `{ "name": "atlapool", "version": <Cargo.toml version> }`
 
+### `notifications/initialized`
+
+- 標準 MCP client 在 `initialize` 回應後會發送 `notifications/initialized` 通知。
+- 增加 `POST /mcp/notify` 路由，與 `mcp_handler` 共用同一處理邏輯；收到 `notifications/*` 方法時回傳 `202 Accepted`。
+- 這讓標準 client 的連線流程可以完整結束，而不需要改變 `tools/call` 上游 JSON 直穿的回傳格式。
+
 ### `tools/list`
 
 - 與 `tools/call` 相同，需要有效的 `X-Atlapool-Key`。
@@ -43,11 +49,13 @@ Issue #68 要求補齊這兩個方法，並為目前全部約 18 支工具定義
 
 - `mcp.rs` 的 `mcp_handler` 需要重構：先解析 JSON-RPC request，再根據 `method` 分派。
 - 新增 `initialize_handler`、`tools_list_handler`、工具 schema 產生邏輯。
+- 增加 `POST /mcp/notify` 路由，統一處理 MCP 通知類方法。
 - README 與 `config.example.toml` 需說明 `/mcp` 支援 `initialize`/`tools/list`/`tools/call`。
-- 需要新增測試：initialize 無 key、tools/list 認證與過濾、完整的 `initialize` → `tools/list` → `tools/call` 流程。
+- 需要新增測試：initialize 無 key、tools/list 認證與過濾、完整的 `initialize` → `tools/list` → `tools/call` 流程，並使用真正的 MCP client library 驗證。
 
 ## 風險
 
 - `initialize` 不驗證 key，但這符合 MCP 慣例；`tools/list`/`tools/call` 仍保持原有認證。
 - `tools/list` 只按 `tools` allowlist 過濾，不檢查 `projects`/`spaces`/`bitbucket_*` 等維度，因此可能列出 caller 實際無法呼叫維度的工具；這與 Issue 規格一致，但在維度 allowlist 過嚴時會讓工具列表「過寬」。
 - 工具 schema 必須與 `resolve_target` 的參數檢查保持一致，未來新增工具時要同步更新。
+- `tools/call` 仍直穿上游 JSON 作為 JSON-RPC `result`，而不是標準 MCP `CallToolResult` 結構。這讓高階 `client.call_tool()` 無法直接解析，因此完整 client 流程的 `tools/call` 步驟以 SDK 底層 transport 發送 JSON-RPC 並解析原始 `result` 來驗證。未來若需支援通用 MCP client 的 `call_tool()`，需再評估是否將結果包裝成 `CallToolResult`。
