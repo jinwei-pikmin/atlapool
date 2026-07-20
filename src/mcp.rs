@@ -276,7 +276,10 @@ async fn forward<C: UpstreamClient>(
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
     let target_string = target.target_string();
 
-    let upstream_request = match client.build_request(target.method, &target.path, target.body) {
+    let upstream_request = match client
+        .build_request(target.method, &target.path, target.body)
+        .await
+    {
         Ok(req) => req,
         Err(e) => {
             let error_message = e.to_string();
@@ -939,6 +942,7 @@ mod tests {
                 base_url: Some(base_url),
                 workspace: Some("WORK".into()),
                 token: Some(SecretString::new("test-token")),
+                oauth: None,
             }),
             mcp: McpConfig::default(),
             audit: AuditConfig { path: audit_path },

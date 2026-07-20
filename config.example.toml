@@ -41,21 +41,34 @@ port = 8080
 
 [bitbucket]
 # Bitbucket Cloud credentials. `workspace` is used as the default workspace for
-# all bitbucket_* tool calls. `token` is sent as `Authorization: Bearer <token>`.
-# `base_url` is optional and defaults to the Bitbucket Cloud REST API gateway
-# (https://api.bitbucket.org/2.0); override it for tests or private installs.
+# all bitbucket_* tool calls. `base_url` is optional and defaults to the
+# Bitbucket Cloud REST API gateway (https://api.bitbucket.org/2.0); override it
+# for tests or private installs.
 # workspace = "my-workspace"
 # base_url = "https://api.bitbucket.org/2.0"
 #
+# Authentication: choose either a long-lived `token` or short-lived OAuth.
+#
+# Option A: static token (App password, Workspace/Project access token, or
+# long-lived OAuth access token). Workspace/Project access tokens require
+# Bitbucket Premium and are tied to the workspace, not a user.
 # Required Bitbucket App password / OAuth consumer permissions:
 #   - read: repository:read, pullrequest:read
 #   - write: repository:write, pullrequest:write
 #   - create repository: repository:admin (Bitbucket requires admin scope for repo creation)
-#
 # token supports the same secret reference formats as atlassian.token:
 # token = "env:BITBUCKET_TOKEN"
 # token = "aws:secretsmanager:prod/bitbucket/token"
 # token = "gcp:secretmanager:my-project/bitbucket-token"
+#
+# Option B: OAuth 2.0 client credentials grant.
+# The client_id / client_secret come from a Bitbucket OAuth consumer.
+# atlapool will fetch and cache a 2-hour access token and refresh it before
+# expiry. Scopes are controlled by the consumer, not atlapool.
+# [bitbucket.oauth]
+# client_id = "env:BITBUCKET_CLIENT_ID"
+# client_secret = "env:BITBUCKET_CLIENT_SECRET"
+# token_url = "https://bitbucket.org/site/oauth2/access_token"  # optional
 
 [mcp]
 # Reserved fields. The server currently does not gate the /mcp endpoint on

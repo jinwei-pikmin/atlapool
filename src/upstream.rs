@@ -35,16 +35,16 @@ pub enum UpstreamError {
     MissingConfig(&'static str),
     InvalidUrl(String),
     RequestBuild(reqwest::Error),
+    TokenFetch(String),
 }
 
 impl std::fmt::Display for UpstreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UpstreamError::MissingConfig(field) => {
-                write!(f, "missing atlassian config: {}", field)
-            }
+            UpstreamError::MissingConfig(field) => write!(f, "missing config: {}", field),
             UpstreamError::InvalidUrl(url) => write!(f, "invalid upstream url: {}", url),
             UpstreamError::RequestBuild(err) => write!(f, "failed to build request: {}", err),
+            UpstreamError::TokenFetch(err) => write!(f, "failed to fetch Bitbucket token: {}", err),
         }
     }
 }
@@ -88,7 +88,7 @@ impl JiraClient {
     }
 
     /// Build a request from an empty header set, injecting only the bearer token.
-    pub fn request(
+    pub async fn request(
         &self,
         method: Method,
         path: &str,
@@ -119,24 +119,29 @@ impl JiraClient {
     }
 
     #[allow(dead_code)]
-    pub fn myself_request(&self) -> Result<reqwest::Request, UpstreamError> {
+    pub async fn myself_request(&self) -> Result<reqwest::Request, UpstreamError> {
         self.request(Method::GET, "/rest/api/3/myself", RequestBody::None)
+            .await
     }
 
     #[allow(dead_code)]
-    pub fn get_issue_request(&self, issue_key: &str) -> Result<reqwest::Request, UpstreamError> {
+    pub async fn get_issue_request(
+        &self,
+        issue_key: &str,
+    ) -> Result<reqwest::Request, UpstreamError> {
         self.request(
             Method::GET,
             &format!("/rest/api/3/issue/{issue_key}"),
             RequestBody::None,
         )
+        .await
     }
 }
 
 /// Abstraction over upstream clients so `mcp_handler` can forward requests
 /// without knowing the concrete upstream type.
 pub trait UpstreamClient: Send + Sync {
-    fn build_request(
+    async fn build_request(
         &self,
         method: Method,
         path: &str,
@@ -148,13 +153,13 @@ pub trait UpstreamClient: Send + Sync {
 }
 
 impl UpstreamClient for JiraClient {
-    fn build_request(
+    async fn build_request(
         &self,
         method: Method,
         path: &str,
         body: RequestBody,
     ) -> Result<reqwest::Request, UpstreamError> {
-        self.request(method, path, body)
+        self.request(method, path, body).await
     }
 
     async fn execute(
@@ -189,20 +194,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn myself_request_injects_bearer_token() {
+    #[tokio::test]
+    async fn myself_request_injects_bearer_token() {
         let client = JiraClient::new(&test_config()).unwrap();
-        let request = client.myself_request().unwrap();
+        let request = client.myself_request().await.unwrap();
         let headers = request.headers();
 
         let auth = headers.get(AUTHORIZATION).unwrap().to_str().unwrap();
         assert_eq!(auth, "Bearer test-token");
     }
 
-    #[test]
-    fn myself_request_drops_caller_sensitive_headers() {
+    #[tokio::test]
+    async fn myself_request_drops_caller_sensitive_headers() {
         let client = JiraClient::new(&test_config()).unwrap();
-        let request = client.myself_request().unwrap();
+        let request = client.myself_request().await.unwrap();
         let headers = request.headers();
 
         // The request must not carry any cookie from the caller.
@@ -211,19 +216,19 @@ mod tests {
         assert_eq!(headers.get_all(AUTHORIZATION).iter().count(), 1);
     }
 
-    #[test]
-    fn myself_request_url_points_to_jira_myself() {
+    #[tokio::test]
+    async fn myself_request_url_points_to_jira_myself() {
         let client = JiraClient::new(&test_config()).unwrap();
-        let request = client.myself_request().unwrap();
+        let request = client.myself_request().await.unwrap();
 
         assert_eq!(request.method(), Method::GET);
         assert_eq!(request.url().path(), "/rest/api/3/myself");
     }
 
-    #[test]
-    fn myself_request_url_uses_cloud_id_gateway() {
+    #[tokio::test]
+    async fn myself_request_url_uses_cloud_id_gateway() {
         let client = JiraClient::new(&cloud_id_config()).unwrap();
-        let request = client.myself_request().unwrap();
+        let request = client.myself_request().await.unwrap();
 
         assert_eq!(request.url().host_str(), Some("api.atlassian.com"));
         assert_eq!(
@@ -232,10 +237,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn get_issue_request_builds_correct_path() {
+    #[tokio::test]
+    async fn get_issue_request_builds_correct_path() {
         let client = JiraClient::new(&test_config()).unwrap();
-        let request = client.get_issue_request("PROJ-123").unwrap();
+        let request = client.get_issue_request("PROJ-123").await.unwrap();
 
         assert_eq!(request.method(), Method::GET);
         assert_eq!(request.url().path(), "/rest/api/3/issue/PROJ-123");
