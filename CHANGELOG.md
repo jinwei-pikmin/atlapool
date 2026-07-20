@@ -10,6 +10,12 @@ All notable changes to this project will be documented in this file.
   - `bitbucket_list_branches`
   - `bitbucket_list_directory`
   - `bitbucket_get_file_content`
+- MCP protocol completeness:
+  - `initialize` handshake (no key required)
+  - `tools/list` returning per-agent allowed tools with JSON Schema `inputSchema`
+  - `notifications/initialized` support on `POST /mcp/notify`
+  - `tools/call` returns standard MCP `CallToolResult` when `Mcp-Protocol-Version` header is present, including `isError: true` for non-2xx upstream responses
+  - Full `initialize` → `tools/list` → `tools/call` flow verified with the official `rmcp` client library over a real TCP listener
 
 ## [0.1.0] - 2026-07-19
 

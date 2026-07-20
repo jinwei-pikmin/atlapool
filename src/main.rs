@@ -77,6 +77,7 @@ fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/stats", get(stats))
         .route("/mcp", post(mcp::mcp_handler))
+        .route("/mcp/notify", post(mcp::mcp_handler))
         .with_state(state)
 }
 

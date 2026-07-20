@@ -91,27 +91,6 @@ pub async fn mcp_handler(
         );
     }
 
-    let key = headers
-        .get(MCP_KEY_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty());
-
-    let Some(key) = key else {
-        return mcp_error(
-            None,
-            StatusCode::UNAUTHORIZED,
-            "missing or empty X-Atlapool-Key",
-        );
-    };
-
-    let agent = match agents::find_agent(&state.config.agents, key) {
-        Some(a) => a,
-        None => {
-            tracing::warn!("rejected request: unknown X-Atlapool-Key");
-            return mcp_error(None, StatusCode::UNAUTHORIZED, "unknown key");
-        }
-    };
-
     let request: McpRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -127,7 +106,15 @@ pub async fn mcp_handler(
         return mcp_error(request.id, StatusCode::BAD_REQUEST, "jsonrpc must be 2.0");
     }
 
-    if request.method != "tools/call" {
+    if request.method == "initialize" {
+        return initialize_handler(request.id).await;
+    }
+
+    if request.method.starts_with("notifications/") {
+        return (StatusCode::ACCEPTED, Json(json!({})));
+    }
+
+    if request.method != "tools/list" && request.method != "tools/call" {
         return mcp_error(
             request.id,
             StatusCode::NOT_IMPLEMENTED,
@@ -135,6 +122,37 @@ pub async fn mcp_handler(
         );
     }
 
+    // tools/list and tools/call require a valid agent key.
+    // Standard MCP clients (e.g. rmcp) send Mcp-Protocol-Version and expect
+    // tools/call results in CallToolResult format; curl/manual callers do not.
+    let wrap_calltool = headers.get("mcp-protocol-version").is_some();
+
+    let key = headers
+        .get(MCP_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty());
+
+    let Some(key) = key else {
+        return mcp_error(
+            request.id,
+            StatusCode::UNAUTHORIZED,
+            "missing or empty X-Atlapool-Key",
+        );
+    };
+
+    let agent = match agents::find_agent(&state.config.agents, key) {
+        Some(a) => a,
+        None => {
+            tracing::warn!("rejected request: unknown X-Atlapool-Key");
+            return mcp_error(request.id, StatusCode::UNAUTHORIZED, "unknown key");
+        }
+    };
+
+    if request.method == "tools/list" {
+        return tools_list_handler(request.id, agent);
+    }
+
+    // tools/call from here on.
     let params: McpToolParams = match request.params {
         Some(v) => match serde_json::from_value(v) {
             Ok(p) => p,
@@ -259,6 +277,7 @@ pub async fn mcp_handler(
             params.name.clone(),
             request.id.clone(),
             target,
+            wrap_calltool,
         )
         .await
     } else if params.name.starts_with("bitbucket_") {
@@ -288,6 +307,7 @@ pub async fn mcp_handler(
             params.name.clone(),
             request.id.clone(),
             target,
+            wrap_calltool,
         )
         .await
     } else {
@@ -330,6 +350,7 @@ pub async fn mcp_handler(
             params.name.clone(),
             request.id.clone(),
             target,
+            wrap_calltool,
         )
         .await
     };
@@ -347,6 +368,7 @@ async fn forward<C: UpstreamClient>(
     tool: String,
     request_id: Option<Value>,
     target: ToolTarget,
+    wrap_calltool: bool,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
     let target_string = target.target_string();
 
@@ -432,10 +454,18 @@ async fn forward<C: UpstreamClient>(
                 )
                 .await;
         }
-        (
-            StatusCode::OK,
-            json!({"jsonrpc":"2.0","id": request_id, "result": upstream_body}),
-        )
+        let result = wrap_calltool_result(&upstream_body, false);
+        if wrap_calltool {
+            (
+                StatusCode::OK,
+                json!({"jsonrpc":"2.0","id": request_id, "result": result}),
+            )
+        } else {
+            (
+                StatusCode::OK,
+                json!({"jsonrpc":"2.0","id": request_id, "result": upstream_body}),
+            )
+        }
     } else {
         let message = format!("upstream returned {}", upstream_status);
         if let Some(ref audit) = audit {
@@ -450,21 +480,58 @@ async fn forward<C: UpstreamClient>(
                 )
                 .await;
         }
-        (
-            StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32000,
-                    "message": message,
-                    "data": upstream_body
-                }
-            }),
-        )
+        if wrap_calltool {
+            let result = wrap_calltool_result(&upstream_body, true);
+            (
+                StatusCode::OK,
+                json!({"jsonrpc":"2.0","id": request_id, "result": result}),
+            )
+        } else {
+            (
+                StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32000,
+                        "message": message,
+                        "data": upstream_body
+                    }
+                }),
+            )
+        }
     };
 
     Ok((status, Json(envelope)))
+}
+
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+fn wrap_calltool_result(upstream_body: &Value, is_error: bool) -> Value {
+    let mut result = json!({
+        "content": [{"type": "text", "text": ""}],
+        "isError": is_error
+    });
+    match upstream_body {
+        Value::String(text) => {
+            result["content"][0]["text"] = json!(text);
+            result
+        }
+        _ => {
+            result["content"][0]["text"] = json!(upstream_body.to_string());
+            result["structuredContent"] = upstream_body.clone();
+            result
+        }
+    }
+}
+
+fn mcp_success(id: Option<Value>, result: Value) -> (StatusCode, Json<Value>) {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    });
+    (StatusCode::OK, Json(body))
 }
 
 fn mcp_error(id: Option<Value>, status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
@@ -474,6 +541,298 @@ fn mcp_error(id: Option<Value>, status: StatusCode, message: &str) -> (StatusCod
         "error": { "code": -32000, "message": message }
     });
     (status, Json(body))
+}
+
+async fn initialize_handler(id: Option<Value>) -> (StatusCode, Json<Value>) {
+    mcp_success(
+        id,
+        json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {
+                "tools": {}
+            },
+            "serverInfo": {
+                "name": "atlapool",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }),
+    )
+}
+
+struct Tool {
+    name: &'static str,
+    description: &'static str,
+    input_schema: Value,
+}
+
+fn tools_list_handler(id: Option<Value>, agent: &agents::AgentConfig) -> (StatusCode, Json<Value>) {
+    let allowed: Vec<Value> = all_tools()
+        .into_iter()
+        .filter(|t| agent.tools.iter().any(|allowed| allowed == t.name))
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": t.input_schema
+            })
+        })
+        .collect();
+    mcp_success(id, json!({ "tools": allowed }))
+}
+
+fn all_tools() -> Vec<Tool> {
+    vec![
+        Tool {
+            name: "jira_get_issue",
+            description: "Fetch a Jira issue by key.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "issue_key": { "type": "string", "description": "Issue key, e.g. PROJ-123" }
+                },
+                "required": ["issue_key"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "jira_create_issue",
+            description: "Create a new Jira issue.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Jira project key" },
+                    "summary": { "type": "string", "description": "Issue summary" },
+                    "fields": { "type": "object", "description": "Additional Jira fields" }
+                },
+                "required": ["project", "summary"],
+                "additionalProperties": true
+            }),
+        },
+        Tool {
+            name: "jira_add_comment",
+            description: "Add a comment to a Jira issue.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "issue_key": { "type": "string", "description": "Issue key, e.g. PROJ-123" },
+                    "body": { "description": "Comment body (ADF object or string)" }
+                },
+                "required": ["issue_key", "body"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "jira_update_issue",
+            description: "Update a Jira issue (summary, assignee, or append description).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "issue_key": { "type": "string", "description": "Issue key, e.g. PROJ-123" },
+                    "summary": { "type": "string", "description": "Overwrite summary" },
+                    "assignee": { "type": "string", "description": "Atlassian accountId" },
+                    "description_append": { "type": "string", "description": "Text to append to description" }
+                },
+                "required": ["issue_key"],
+                "minProperties": 1,
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "jira_get_transitions",
+            description: "List available transitions for a Jira issue.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "issue_key": { "type": "string", "description": "Issue key, e.g. PROJ-123" }
+                },
+                "required": ["issue_key"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "jira_transition_issue",
+            description: "Transition a Jira issue to a new status.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "issue_key": { "type": "string", "description": "Issue key, e.g. PROJ-123" },
+                    "transition_id": { "type": "string", "description": "Numeric transition id" }
+                },
+                "required": ["issue_key", "transition_id"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "confluence_get_page",
+            description: "Fetch a Confluence page by ID.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "page_id": { "type": "string", "description": "Numeric page ID" },
+                    "space": { "type": "string", "description": "Space key for allowlist" }
+                },
+                "required": ["page_id", "space"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "confluence_create_page",
+            description: "Create a Confluence page.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "space": { "type": "string", "description": "Space key for allowlist" },
+                    "space_id": { "type": "string", "description": "Numeric space ID" },
+                    "title": { "type": "string" },
+                    "body": { "type": "string", "description": "Storage-format HTML" },
+                    "parent_id": { "type": "string", "description": "Optional numeric parent page ID" }
+                },
+                "required": ["space", "space_id", "title", "body"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "confluence_update_page",
+            description: "Update a Confluence page.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "space": { "type": "string", "description": "Space key for allowlist" },
+                    "space_id": { "type": "string", "description": "Numeric space ID" },
+                    "page_id": { "type": "string", "description": "Numeric page ID" },
+                    "title": { "type": "string" },
+                    "version": { "type": "string", "description": "Positive integer version" },
+                    "body": { "type": "string", "description": "Storage-format HTML" }
+                },
+                "required": ["space", "space_id", "page_id", "title", "version", "body"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "bitbucket_get_repo",
+            description: "Fetch a Bitbucket repository.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" }
+                },
+                "required": ["repo_slug"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "bitbucket_get_pull_request",
+            description: "Fetch a Bitbucket pull request.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "pull_request_id": { "type": "string", "description": "Numeric pull request ID" }
+                },
+                "required": ["repo_slug", "pull_request_id"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "bitbucket_list_branches",
+            description: "List branches in a Bitbucket repository.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" }
+                },
+                "required": ["repo_slug"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "bitbucket_list_directory",
+            description: "List files and directories at a path in a Bitbucket repository.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "path": { "type": "string", "description": "Directory path, defaults to root" },
+                    "ref": { "type": "string", "description": "Branch/tag/commit hash, defaults to default branch" }
+                },
+                "required": ["repo_slug"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "bitbucket_get_file_content",
+            description: "Read the raw contents of a file in a Bitbucket repository.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "path": { "type": "string", "description": "File path" },
+                    "ref": { "type": "string", "description": "Branch/tag/commit hash, defaults to default branch" }
+                },
+                "required": ["repo_slug", "path"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "bitbucket_create_repo",
+            description: "Create a new Bitbucket repository.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "is_private": { "type": "boolean", "description": "Defaults to true" }
+                },
+                "required": ["repo_slug"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "bitbucket_create_branch",
+            description: "Create a branch in a Bitbucket repository.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "branch_name": { "type": "string" },
+                    "target_hash": { "type": "string", "description": "Commit hash to point the new branch to" }
+                },
+                "required": ["repo_slug", "branch_name", "target_hash"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "bitbucket_create_commit",
+            description: "Create a commit by uploading files to a Bitbucket repository.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "message": { "type": "string", "description": "Commit message" },
+                    "branch": { "type": "string" },
+                    "parents": { "type": "array", "items": { "type": "string" } },
+                    "files": { "type": "object", "description": "Map of file path to content" }
+                },
+                "required": ["repo_slug", "message", "branch", "files"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "bitbucket_create_pull_request",
+            description: "Create a Bitbucket pull request.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "title": { "type": "string" },
+                    "source_branch": { "type": "string" },
+                    "destination_branch": { "type": "string" },
+                    "description": { "type": "string" }
+                },
+                "required": ["repo_slug", "title", "source_branch"],
+                "additionalProperties": false
+            }),
+        },
+    ]
 }
 
 fn resolve_target(
@@ -1495,14 +1854,31 @@ mod tests {
     }
 
     fn build_request(tool: &str, args: Value, key: Option<&str>) -> Request<Body> {
+        build_jsonrpc_request(
+            "tools/call",
+            json!({
+                "name": tool,
+                "arguments": args
+            }),
+            key,
+        )
+    }
+
+    fn build_jsonrpc_request(method: &str, params: Value, key: Option<&str>) -> Request<Body> {
+        build_jsonrpc_request_with_headers(method, params, key, &[])
+    }
+
+    fn build_jsonrpc_request_with_headers(
+        method: &str,
+        params: Value,
+        key: Option<&str>,
+        extra_headers: &[(&str, &str)],
+    ) -> Request<Body> {
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": tool,
-                "arguments": args
-            }
+            "method": method,
+            "params": params
         })
         .to_string();
 
@@ -1511,12 +1887,32 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json");
 
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+
         if let Some(k) = key {
             builder = builder.header("X-Atlapool-Key", k);
         }
         // A sensitive header that must never reach the upstream Jira server.
         builder = builder.header("cookie", "session=bad");
         builder.body(Body::from(body)).unwrap()
+    }
+
+    fn build_request_with_protocol_version(
+        tool: &str,
+        args: Value,
+        key: Option<&str>,
+    ) -> Request<Body> {
+        build_jsonrpc_request_with_headers(
+            "tools/call",
+            json!({
+                "name": tool,
+                "arguments": args
+            }),
+            key,
+            &[("mcp-protocol-version", "2024-11-05")],
+        )
     }
 
     async fn mock_jira_server() -> (u16, Arc<Mutex<Vec<HeaderMap>>>) {
@@ -1625,6 +2021,26 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (port, captured)
+    }
+
+    async fn mock_jira_server_404() -> u16 {
+        let get_handler = |Path(_): Path<String>, headers: HeaderMap| async move {
+            let _ = headers; // silence unused variable warning in tests
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "errorMessages": ["Issue does not exist"],
+                    "errors": {}
+                })),
+            )
+        };
+
+        let app = Router::new().route("/rest/api/3/issue/{key}", get(get_handler));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        port
     }
 
     async fn mock_confluence_server() -> (u16, Arc<Mutex<Vec<HeaderMap>>>) {
@@ -2210,6 +2626,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_get_issue_with_protocol_version_upstream_404_returns_calltool_error() {
+        let port = mock_jira_server_404().await;
+        let mut config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        config.agents[0].tools = vec!["jira_get_issue".into()];
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request_with_protocol_version(
+                "jira_get_issue",
+                json!({"issue_key": "PROJ-999"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        assert_eq!(
+            json["result"]["structuredContent"]["errorMessages"][0],
+            "Issue does not exist"
+        );
     }
 
     #[tokio::test]
@@ -4282,5 +4734,231 @@ mod tests {
         assert!(lines[1].contains("\"status\":204"));
 
         std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_initialize_succeeds_without_key() {
+        let config = test_config("http://127.0.0.1:0".into(), false, None);
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_jsonrpc_request(
+                "initialize",
+                json!({ "protocolVersion": "2024-11-05" }),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(json["result"]["serverInfo"]["name"], "atlapool");
+        assert!(!json["result"]["serverInfo"]["version"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+        assert!(json["result"]["capabilities"]["tools"].is_object());
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_list_requires_key() {
+        let config = test_config("http://127.0.0.1:0".into(), false, None);
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_jsonrpc_request("tools/list", json!({}), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_list_returns_allowed_tools_with_schemas() {
+        let config = test_config("http://127.0.0.1:0".into(), false, None);
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_jsonrpc_request(
+                "tools/list",
+                json!({}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        let tools = json["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+
+        assert!(names.contains(&"jira_get_issue"));
+        assert!(names.contains(&"jira_transition_issue"));
+        assert!(!names.contains(&"confluence_get_page"));
+        assert!(!names.contains(&"bitbucket_get_repo"));
+
+        for tool in tools {
+            assert!(tool["inputSchema"]["type"].as_str() == Some("object"));
+            assert!(tool["description"].as_str().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_full_flow_initialize_tools_list_call() {
+        let (port, _captured) = mock_jira_server().await;
+        let mut config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        // Keep only one read tool for the flow test.
+        config.agents[0].tools = vec!["jira_get_issue".into()];
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+
+        // initialize
+        let response = app
+            .clone()
+            .oneshot(build_jsonrpc_request(
+                "initialize",
+                json!({ "protocolVersion": "2024-11-05" }),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let init: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(init["result"]["protocolVersion"], "2024-11-05");
+
+        // tools/list
+        let response = app
+            .clone()
+            .oneshot(build_jsonrpc_request(
+                "tools/list",
+                json!({}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let list: Value = serde_json::from_slice(&bytes).unwrap();
+        let tools = list["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "jira_get_issue");
+
+        // tools/call
+        let response = app
+            .oneshot(build_request(
+                "jira_get_issue",
+                json!({"issue_key": "PROJ-123"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let call: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(call["result"]["key"], "PROJ-123");
+    }
+
+    #[tokio::test]
+    async fn mcp_real_client_initialize_list_call_flow() {
+        use axum::http::{HeaderName, HeaderValue};
+        use rmcp::model::CallToolRequestParams;
+        use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+        use rmcp::transport::StreamableHttpClientTransport;
+        use rmcp::ServiceExt;
+
+        let (port, _captured) = mock_jira_server().await;
+        let mut config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        config.agents[0].tools = vec!["jira_get_issue".into()];
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut custom_headers = std::collections::HashMap::new();
+        custom_headers.insert(
+            HeaderName::from_static("x-atlapool-key"),
+            HeaderValue::from_static("agent-key"),
+        );
+
+        let transport_config = StreamableHttpClientTransportConfig::with_uri(format!(
+            "http://127.0.0.1:{}/mcp",
+            server_port
+        ))
+        .custom_headers(custom_headers);
+
+        let transport = StreamableHttpClientTransport::from_config(transport_config);
+        let client = ().serve(transport).await.unwrap();
+
+        let tools = client.peer().list_all_tools().await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name.as_ref(), "jira_get_issue");
+
+        let args = serde_json::json!({"issue_key": "PROJ-123"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let result = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("jira_get_issue").with_arguments(args))
+            .await
+            .unwrap();
+
+        let structured = result
+            .structured_content
+            .expect("expected structured content");
+        assert_eq!(structured["key"], "PROJ-123");
     }
 }

@@ -23,4 +23,5 @@ aws-sdk-secretsmanager = "1.109.0"
 google-cloud-secretmanager-v1 = "1.11.0"
 
 [dev-dependencies]
+rmcp = { version = "2.2.0", features = ["client", "transport-streamable-http-client-reqwest"] }
 tower = { version = "0.5", features = ["util"] }
