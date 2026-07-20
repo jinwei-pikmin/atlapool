@@ -38,6 +38,7 @@ v0.1 的 Bitbucket 整合將同一組長效 Service Account token（App password
 - 取得的是 **workspace/consumer 等級 access token**，不是逐 repo scoped token。
 - repo 層級的隔離仍由 atlapool 自己的 `bitbucket_repos` allowlist 與請求路徑驗證來保證。
 - 真正的 repo-scoped token（Connect app JWT exchange）列為 **v0.3 或後續研究**。
+- 選擇 OAuth consumer 而非 Workspace/Project access token 的主要原因是：後者為 Bitbucket Premium 限定功能，而 OAuth consumer 在免費方案中即可使用，且能避免憑證綁定個人帳號。
 
 ## 具體設計
 

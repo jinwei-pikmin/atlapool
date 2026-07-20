@@ -727,6 +727,11 @@ Choose one of the following authentication methods:
   consumer `client_id` and `client_secret`. atlapool will fetch a 2-hour access
   token and refresh it before expiry. The consumer must be granted at least:
 
+  > **Why client credentials instead of Workspace/Project access tokens?**
+  > Workspace and Project access tokens are a Bitbucket Premium-only feature.
+  > An OAuth consumer works on free plans and is the only no-cost way to obtain
+  > credentials that are not tied to an individual user account.
+
 - `repository:read` — for `bitbucket_get_repo`
 - `pullrequest:read` — for `bitbucket_get_pull_request`
 - `repository:write` — for `bitbucket_create_branch`, `bitbucket_create_commit`
