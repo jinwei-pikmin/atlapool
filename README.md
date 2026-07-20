@@ -658,7 +658,7 @@ Notes:
 | `[atlassian]` | `token` | Atlassian tools: **Yes** | — | Atlassian API token, in any secret-ref format above. |
 | `[bitbucket]` | `workspace` | Bitbucket tools: **Yes** | — | Workspace slug; server injects it into every Bitbucket path. |
 | `[bitbucket]` | `base_url` | No | `https://api.bitbucket.org/2.0` | Only override for private Bitbucket Server. |
-| `[bitbucket]` | `token` | Bitbucket tools: **One of token/oauth** | — | Long-lived app password / access token. |
+| `[bitbucket]` | `token` | Bitbucket tools: **One of token/oauth** | — | App password, Workspace/Project access token (Premium), or long-lived OAuth access token. |
 | `[bitbucket.oauth]` | `client_id` | OAuth: **Yes** | — | OAuth consumer key. Secret reference. |
 | `[bitbucket.oauth]` | `client_secret` | OAuth: **Yes** | — | OAuth consumer secret. Secret reference. |
 | `[bitbucket.oauth]` | `token_url` | No | `https://bitbucket.org/site/oauth2/access_token` | Token endpoint override. |
@@ -722,21 +722,32 @@ REST calls are sent through the `api.atlassian.com` gateway using `cloud_id`:
 
 Choose one of the following authentication methods:
 
-- **App password / long-lived access token**: configure `[bitbucket].token`.
-- **OAuth 2.0 client credentials**: configure `[bitbucket.oauth]` with a
-  consumer `client_id` and `client_secret`. atlapool will fetch a 2-hour access
-  token and refresh it before expiry. The consumer must be granted at least:
+1. **App password** (deprecated by Atlassian; use for legacy integrations only):
+   configure `[bitbucket].token`. Tied to an individual user account.
 
-  > **Why client credentials instead of Workspace/Project access tokens?**
-  > Workspace and Project access tokens are a Bitbucket Premium-only feature.
-  > An OAuth consumer works on free plans and is the only no-cost way to obtain
-  > credentials that are not tied to an individual user account.
+2. **Workspace or Project access token** (Bitbucket Premium): configure
+   `[bitbucket].token`. Tied to the workspace/project, not a person, and supports
+   the same `repository:*` / `pullrequest:*` scopes as an app password.
 
-- `repository:read` — for `bitbucket_get_repo`
-- `pullrequest:read` — for `bitbucket_get_pull_request`
-- `repository:write` — for `bitbucket_create_branch`, `bitbucket_create_commit`
-- `repository:admin` — for `bitbucket_create_repo` (Bitbucket's API requires admin scope to create repositories; this is different from `repository:write`)
-- `pullrequest:write` — for `bitbucket_create_pull_request`
+3. **OAuth 2.0 client credentials** (free plan friendly; new in PR #57): configure
+   `[bitbucket.oauth]`. atlapool will fetch a 2-hour access token and refresh it
+   before expiry. The consumer must be granted at least:
+
+   - `repository:read` — for `bitbucket_get_repo`
+   - `pullrequest:read` — for `bitbucket_get_pull_request`
+   - `repository:write` — for `bitbucket_create_branch`, `bitbucket_create_commit`
+   - `repository:admin` — for `bitbucket_create_repo` (Bitbucket's API requires admin scope to create repositories; this is different from `repository:write`)
+   - `pullrequest:write` — for `bitbucket_create_pull_request`
+
+   > **Why OAuth client credentials instead of Workspace/Project access tokens?**
+   > Workspace and Project access tokens are a Bitbucket Premium-only feature.
+   > An OAuth consumer works on free plans and is the only no-cost way to obtain
+   > credentials that are not tied to an individual user account.
+
+If you are migrating from the earlier E2E setup, `atlapool_bitbucket_token` may
+be either an app password or a Workspace/Project access token; both work in
+`[bitbucket].token`. Ask your Bitbucket admin which one was provisioned if you
+need to rotate or replace it.
 
 Bitbucket calls are sent to `https://api.bitbucket.org/2.0` (or `bitbucket.base_url`
 if overridden):

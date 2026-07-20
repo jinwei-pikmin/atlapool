@@ -49,7 +49,9 @@ port = 8080
 #
 # Authentication: choose either a long-lived `token` or short-lived OAuth.
 #
-# Option A: static token (App password or long-lived access token).
+# Option A: static token (App password, Workspace/Project access token, or
+# long-lived OAuth access token). Workspace/Project access tokens require
+# Bitbucket Premium and are tied to the workspace, not a user.
 # Required Bitbucket App password / OAuth consumer permissions:
 #   - read: repository:read, pullrequest:read
 #   - write: repository:write, pullrequest:write
