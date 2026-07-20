@@ -123,6 +123,8 @@ pub async fn mcp_handler(
     }
 
     // tools/list and tools/call require a valid agent key.
+    let mcp_client = headers.get("mcp-protocol-version").is_some();
+
     let key = headers
         .get(MCP_KEY_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -273,6 +275,7 @@ pub async fn mcp_handler(
             params.name.clone(),
             request.id.clone(),
             target,
+            mcp_client,
         )
         .await
     } else if params.name.starts_with("bitbucket_") {
@@ -302,6 +305,7 @@ pub async fn mcp_handler(
             params.name.clone(),
             request.id.clone(),
             target,
+            mcp_client,
         )
         .await
     } else {
@@ -344,6 +348,7 @@ pub async fn mcp_handler(
             params.name.clone(),
             request.id.clone(),
             target,
+            mcp_client,
         )
         .await
     };
@@ -361,6 +366,7 @@ async fn forward<C: UpstreamClient>(
     tool: String,
     request_id: Option<Value>,
     target: ToolTarget,
+    wrap_calltool: bool,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
     let target_string = target.target_string();
 
@@ -446,9 +452,18 @@ async fn forward<C: UpstreamClient>(
                 )
                 .await;
         }
+        let result = if wrap_calltool {
+            json!({
+                "content": [{"type": "text", "text": upstream_body.to_string()}],
+                "isError": false,
+                "structuredContent": upstream_body
+            })
+        } else {
+            upstream_body
+        };
         (
             StatusCode::OK,
-            json!({"jsonrpc":"2.0","id": request_id, "result": upstream_body}),
+            json!({"jsonrpc":"2.0","id": request_id, "result": result}),
         )
     } else {
         let message = format!("upstream returned {}", upstream_status);
@@ -4775,10 +4790,11 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_real_client_initialize_list_call_flow() {
-        use mcp_protocol_sdk::client::McpClient;
-        use mcp_protocol_sdk::protocol::types::{JsonRpcRequest, RequestId};
-        use mcp_protocol_sdk::transport::traits::Transport;
-        use mcp_protocol_sdk::transport::{HttpClientTransport, TransportConfig};
+        use axum::http::{HeaderName, HeaderValue};
+        use rmcp::model::CallToolRequestParams;
+        use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+        use rmcp::transport::StreamableHttpClientTransport;
+        use rmcp::ServiceExt;
 
         let (port, _captured) = mock_jira_server().await;
         let mut config = test_config(format!("http://127.0.0.1:{}", port), false, None);
@@ -4799,59 +4815,38 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let mut headers = std::collections::HashMap::new();
-        headers.insert("x-atlapool-key".to_string(), "agent-key".to_string());
+        let mut custom_headers = std::collections::HashMap::new();
+        custom_headers.insert(
+            HeaderName::from_static("x-atlapool-key"),
+            HeaderValue::from_static("agent-key"),
+        );
 
-        let transport_config = TransportConfig {
-            connect_timeout_ms: Some(5_000),
-            read_timeout_ms: Some(5_000),
-            write_timeout_ms: Some(5_000),
-            max_message_size: Some(1024 * 1024),
-            keep_alive_ms: None,
-            compression: false,
-            headers,
-        };
+        let transport_config = StreamableHttpClientTransportConfig::with_uri(format!(
+            "http://127.0.0.1:{}/mcp",
+            server_port
+        ))
+        .custom_headers(custom_headers);
 
-        // Use the real MCP client library for initialize and tools/list.
-        let client_transport = HttpClientTransport::with_config(
-            format!("http://127.0.0.1:{}", server_port),
-            None::<String>,
-            transport_config.clone(),
-        )
-        .await
-        .unwrap();
+        let transport = StreamableHttpClientTransport::from_config(transport_config);
+        let client = ().serve(transport).await.unwrap();
 
-        let mut client = McpClient::new("atlapool-test-client".into(), "1.0.0".into());
-        let init = client.connect(client_transport).await.unwrap();
-        assert_eq!(init.server_info.name, "atlapool");
+        let tools = client.peer().list_all_tools().await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name.as_ref(), "jira_get_issue");
 
-        let tools = client.list_tools(None).await.unwrap();
-        assert_eq!(tools.tools.len(), 1);
-        assert_eq!(tools.tools[0].name, "jira_get_issue");
+        let args = serde_json::json!({"issue_key": "PROJ-123"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let result = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("jira_get_issue").with_arguments(args))
+            .await
+            .unwrap();
 
-        // Use a second transport from the same SDK to issue tools/call and verify
-        // the raw JSON-RPC result. This proves the protocol-compatible handshake
-        // discovered by the client can be followed by an actual tool invocation.
-        let mut call_transport = HttpClientTransport::with_config(
-            format!("http://127.0.0.1:{}", server_port),
-            None::<String>,
-            transport_config,
-        )
-        .await
-        .unwrap();
-
-        let request = JsonRpcRequest::new(
-            RequestId::from(2),
-            "tools/call".into(),
-            Some(serde_json::json!({
-                "name": "jira_get_issue",
-                "arguments": { "issue_key": "PROJ-123" }
-            })),
-        )
-        .unwrap();
-
-        let response = call_transport.send_request(request).await.unwrap();
-        let result = response.result.expect("expected result");
-        assert_eq!(result["key"], "PROJ-123");
+        let structured = result
+            .structured_content
+            .expect("expected structured content");
+        assert_eq!(structured["key"], "PROJ-123");
     }
 }
