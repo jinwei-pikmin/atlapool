@@ -123,10 +123,6 @@ pub async fn mcp_handler(
     }
 
     // tools/list and tools/call require a valid agent key.
-    // Standard MCP clients (e.g. rmcp) send Mcp-Protocol-Version and expect
-    // tools/call results in CallToolResult format; curl/manual callers do not.
-    let wrap_calltool = headers.get("mcp-protocol-version").is_some();
-
     let key = headers
         .get(MCP_KEY_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -269,7 +265,6 @@ pub async fn mcp_handler(
             params.name.clone(),
             request.id.clone(),
             target,
-            wrap_calltool,
         )
         .await
     } else if params.name.starts_with("bitbucket_") {
@@ -299,7 +294,6 @@ pub async fn mcp_handler(
             params.name.clone(),
             request.id.clone(),
             target,
-            wrap_calltool,
         )
         .await
     } else {
@@ -342,7 +336,6 @@ pub async fn mcp_handler(
             params.name.clone(),
             request.id.clone(),
             target,
-            wrap_calltool,
         )
         .await
     };
@@ -360,7 +353,6 @@ async fn forward<C: UpstreamClient>(
     tool: String,
     request_id: Option<Value>,
     target: ToolTarget,
-    wrap_calltool: bool,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
     let target_string = target.target_string();
 
@@ -447,17 +439,10 @@ async fn forward<C: UpstreamClient>(
                 .await;
         }
         let result = wrap_calltool_result(&upstream_body, false);
-        if wrap_calltool {
-            (
-                StatusCode::OK,
-                json!({"jsonrpc":"2.0","id": request_id, "result": result}),
-            )
-        } else {
-            (
-                StatusCode::OK,
-                json!({"jsonrpc":"2.0","id": request_id, "result": upstream_body}),
-            )
-        }
+        (
+            StatusCode::OK,
+            json!({"jsonrpc":"2.0","id": request_id, "result": result}),
+        )
     } else {
         let message = format!("upstream returned {}", upstream_status);
         if let Some(ref audit) = audit {
@@ -472,26 +457,11 @@ async fn forward<C: UpstreamClient>(
                 )
                 .await;
         }
-        if wrap_calltool {
-            let result = wrap_calltool_result(&upstream_body, true);
-            (
-                StatusCode::OK,
-                json!({"jsonrpc":"2.0","id": request_id, "result": result}),
-            )
-        } else {
-            (
-                StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {
-                        "code": -32000,
-                        "message": message,
-                        "data": upstream_body
-                    }
-                }),
-            )
-        }
+        let result = wrap_calltool_result(&upstream_body, true);
+        (
+            StatusCode::OK,
+            json!({"jsonrpc":"2.0","id": request_id, "result": result}),
+        )
     };
 
     Ok((status, Json(envelope)))
@@ -2321,7 +2291,7 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["result"]["key"], "PROJ-123");
+        assert_eq!(json["result"]["structuredContent"]["key"], "PROJ-123");
 
         let upstream_headers = captured.lock().unwrap().pop().unwrap();
         assert_eq!(
@@ -2430,7 +2400,7 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["result"]["key"], "PROJ-123");
+        assert_eq!(json["result"]["structuredContent"]["key"], "PROJ-123");
 
         let log = std::fs::read_to_string(&audit_path).unwrap();
         let lines: Vec<&str> = log.trim().split('\n').collect();
@@ -2480,7 +2450,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
 
         let log = std::fs::read_to_string(&audit_path).unwrap();
         let lines: Vec<&str> = log.trim().split('\n').collect();
@@ -2529,7 +2504,10 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["result"]["body"]["body"]["type"], "doc");
+        assert_eq!(
+            json["result"]["structuredContent"]["body"]["body"]["type"],
+            "doc"
+        );
 
         let upstream_headers = captured.lock().unwrap().pop().unwrap();
         assert_eq!(
@@ -2846,9 +2824,16 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["result"]["fields"]["summary"], "updated summary");
-        assert!(json["result"]["fields"].get("assignee").is_none());
-        assert!(json["result"]["fields"].get("description").is_none());
+        assert_eq!(
+            json["result"]["structuredContent"]["fields"]["summary"],
+            "updated summary"
+        );
+        assert!(json["result"]["structuredContent"]["fields"]
+            .get("assignee")
+            .is_none());
+        assert!(json["result"]["structuredContent"]["fields"]
+            .get("description")
+            .is_none());
 
         let log = std::fs::read_to_string(&audit_path).unwrap();
         let lines: Vec<&str> = log.trim().split('\n').collect();
@@ -2894,11 +2879,15 @@ mod tests {
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            json["result"]["fields"]["assignee"]["accountId"],
+            json["result"]["structuredContent"]["fields"]["assignee"]["accountId"],
             "account-42"
         );
-        assert!(json["result"]["fields"].get("summary").is_none());
-        assert!(json["result"]["fields"].get("description").is_none());
+        assert!(json["result"]["structuredContent"]["fields"]
+            .get("summary")
+            .is_none());
+        assert!(json["result"]["structuredContent"]["fields"]
+            .get("description")
+            .is_none());
 
         let log = std::fs::read_to_string(&audit_path).unwrap();
         let lines: Vec<&str> = log.trim().split('\n').collect();
@@ -2943,7 +2932,7 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        let description = &json["result"]["fields"]["description"];
+        let description = &json["result"]["structuredContent"]["fields"]["description"];
         assert_eq!(description["type"], "doc");
         let content = description["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
@@ -3092,7 +3081,9 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        let transitions = json["result"]["transitions"].as_array().unwrap();
+        let transitions = json["result"]["structuredContent"]["transitions"]
+            .as_array()
+            .unwrap();
         assert_eq!(transitions.len(), 2);
         assert_eq!(transitions[0]["id"], "1");
         assert_eq!(transitions[0]["name"], "To Do");
@@ -3132,7 +3123,10 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["result"]["transition"]["transition"]["id"], "2");
+        assert_eq!(
+            json["result"]["structuredContent"]["transition"]["transition"]["id"],
+            "2"
+        );
 
         let log = std::fs::read_to_string(&audit_path).unwrap();
         let lines: Vec<&str> = log.trim().split('\n').collect();
@@ -3271,7 +3265,7 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["result"]["title"], "Demo Page");
+        assert_eq!(json["result"]["structuredContent"]["title"], "Demo Page");
 
         let upstream_headers = captured.lock().unwrap().pop().unwrap();
         assert_eq!(
@@ -3427,8 +3421,8 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["result"]["id"], "67890");
-        assert_eq!(json["result"]["title"], "New Page");
+        assert_eq!(json["result"]["structuredContent"]["id"], "67890");
+        assert_eq!(json["result"]["structuredContent"]["title"], "New Page");
 
         let upstream_headers = captured.lock().unwrap().pop().unwrap();
         assert_eq!(
@@ -3651,8 +3645,8 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["result"]["id"], "67890");
-        assert_eq!(json["result"]["parentId"], "67890");
+        assert_eq!(json["result"]["structuredContent"]["id"], "67890");
+        assert_eq!(json["result"]["structuredContent"]["parentId"], "67890");
     }
 
     #[tokio::test]
@@ -3697,8 +3691,8 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["result"]["id"], "67890");
-        assert_eq!(json["result"]["title"], "Updated Page");
+        assert_eq!(json["result"]["structuredContent"]["id"], "67890");
+        assert_eq!(json["result"]["structuredContent"]["title"], "Updated Page");
 
         let upstream_headers = captured.lock().unwrap().pop().unwrap();
         assert_eq!(
@@ -4051,7 +4045,10 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["result"]["full_name"], "WORK/my-repo");
+        assert_eq!(
+            json["result"]["structuredContent"]["full_name"],
+            "WORK/my-repo"
+        );
 
         let upstream_headers = captured.lock().unwrap().pop().unwrap();
         assert_eq!(
@@ -4099,7 +4096,7 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["result"]["id"], "42");
+        assert_eq!(json["result"]["structuredContent"]["id"], "42");
 
         let upstream_headers = captured.lock().unwrap().pop().unwrap();
         assert_eq!(
@@ -4545,7 +4542,9 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        let values = json["result"]["values"].as_array().unwrap();
+        let values = json["result"]["structuredContent"]["values"]
+            .as_array()
+            .unwrap();
         assert_eq!(values.len(), 2);
         assert_eq!(values[0]["name"], "main");
         assert_eq!(values[0]["target"]["hash"], "abc123");
@@ -4596,7 +4595,9 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        let values = json["result"]["values"].as_array().unwrap();
+        let values = json["result"]["structuredContent"]["values"]
+            .as_array()
+            .unwrap();
         assert_eq!(values.len(), 2);
         assert_eq!(values[0]["path"], "README.md");
         assert_eq!(values[1]["path"], "src");
@@ -4635,7 +4636,9 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        let values = json["result"]["values"].as_array().unwrap();
+        let values = json["result"]["structuredContent"]["values"]
+            .as_array()
+            .unwrap();
         assert_eq!(values.len(), 2);
         assert_eq!(values[0]["path"], "src/README.md");
         assert_eq!(values[1]["path"], "src/src");
@@ -4674,7 +4677,7 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(json["result"]
+        assert!(json["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("content of main/README.md"));
@@ -4713,7 +4716,7 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(json["result"]
+        assert!(json["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("content of main/README.md"));
@@ -4885,7 +4888,8 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["result"], json!({}));
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(json["result"]["structuredContent"], json!({}));
 
         let log = std::fs::read_to_string(&audit_path).unwrap();
         let lines: Vec<&str> = log.trim().split('\n').collect();
@@ -5058,7 +5062,7 @@ mod tests {
         let body = response.into_body();
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let call: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(call["result"]["key"], "PROJ-123");
+        assert_eq!(call["result"]["structuredContent"]["key"], "PROJ-123");
     }
 
     #[tokio::test]
@@ -5199,5 +5203,71 @@ mod tests {
         assert_eq!(comment_result.is_error, Some(true));
         let comment_text = &comment_result.content[0].as_text().unwrap().text;
         assert!(comment_text.contains("write tools not enabled for agent"));
+    }
+
+    #[tokio::test]
+    async fn mcp_real_client_bitbucket_get_repo_success() {
+        use axum::http::{HeaderName, HeaderValue};
+        use rmcp::model::CallToolRequestParams;
+        use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+        use rmcp::transport::StreamableHttpClientTransport;
+        use rmcp::ServiceExt;
+
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut custom_headers = std::collections::HashMap::new();
+        custom_headers.insert(
+            HeaderName::from_static("x-atlapool-key"),
+            HeaderValue::from_static("agent-key"),
+        );
+
+        let transport_config = StreamableHttpClientTransportConfig::with_uri(format!(
+            "http://127.0.0.1:{}/mcp",
+            server_port
+        ))
+        .custom_headers(custom_headers);
+
+        let transport = StreamableHttpClientTransport::from_config(transport_config);
+        let client = ().serve(transport).await.unwrap();
+
+        let args = serde_json::json!({"workspace": "WORK", "repo_slug": "my-repo"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let result = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("bitbucket_get_repo").with_arguments(args))
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        let text = &result.content[0].as_text().unwrap().text;
+        assert!(text.contains("WORK/my-repo"));
+
+        let structured = result
+            .structured_content
+            .expect("expected structured content");
+        assert_eq!(structured["full_name"], "WORK/my-repo");
     }
 }

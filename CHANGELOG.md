@@ -14,8 +14,12 @@ All notable changes to this project will be documented in this file.
   - `initialize` handshake (no key required)
   - `tools/list` returning per-agent allowed tools with JSON Schema `inputSchema`
   - `notifications/initialized` support on `POST /mcp/notify`
-  - `tools/call` returns standard MCP `CallToolResult` when `Mcp-Protocol-Version` header is present, including `isError: true` for non-2xx upstream responses and policy denials
+  - `tools/call` always returns standard MCP `CallToolResult`, including `isError: true` for non-2xx upstream responses and policy denials
   - Full `initialize` → `tools/list` → `tools/call` flow verified with the official `rmcp` client library over a real TCP listener
+
+### Changed
+
+- **Critical:** `tools/call` no longer switches response format based on the `Mcp-Protocol-Version` header. Success paths now unconditionally return `CallToolResult{isError: false}`, eliminating format inconsistency between success and error responses in the same session.
 
 ## [0.1.0] - 2026-07-19
 
