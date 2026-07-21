@@ -803,6 +803,20 @@ fn all_tools() -> Vec<Tool> {
                 "additionalProperties": false
             }),
         },
+        Tool {
+            name: "bitbucket_merge_pull_request",
+            description: "Merge a Bitbucket pull request using the merge_commit strategy.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "pull_request_id": { "type": "string", "description": "Numeric pull request ID" },
+                    "close_source_branch": { "type": "boolean", "description": "Close source branch after merge (default true)" }
+                },
+                "required": ["repo_slug", "pull_request_id"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -1386,6 +1400,43 @@ fn resolve_target(
                 space: None,
                 method: Method::POST,
                 path: format!("/repositories/{workspace}/{repo_slug}/pullrequests"),
+                body: RequestBody::json(body),
+                update: None,
+                resolve_ref: None,
+            })
+        }
+        "bitbucket_merge_pull_request" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let pull_request_id = args
+                .get("pull_request_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing pull_request_id")?;
+            if pull_request_id.is_empty() || !pull_request_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err("pull_request_id must be a non-empty numeric id".into());
+            }
+            let close_source_branch = args
+                .get("close_source_branch")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            let body = json!({
+                "merge_strategy": "merge_commit",
+                "close_source_branch": close_source_branch
+            });
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::POST,
+                path: format!(
+                    "/repositories/{workspace}/{repo_slug}/pullrequests/{pull_request_id}/merge"
+                ),
                 body: RequestBody::json(body),
                 update: None,
                 resolve_ref: None,
@@ -3963,6 +4014,20 @@ mod tests {
             }))
         };
 
+        let merge_pr_handler = |State(s): State<MockState>,
+                                Path((workspace, repo, pr_id)): Path<(String, String, String)>,
+                                headers: HeaderMap,
+                                body: String| async move {
+            s.headers.lock().unwrap().push(headers);
+            s.bodies.lock().unwrap().push(body);
+            Json(json!({
+                "id": pr_id,
+                "title": "merged PR",
+                "state": "MERGED",
+                "source": { "repository": { "full_name": format!("{workspace}/{repo}") } }
+            }))
+        };
+
         let create_commit_handler = |State(s): State<MockState>,
                                      Path((workspace, repo)): Path<(String, String)>,
                                      headers: HeaderMap,
@@ -3991,6 +4056,10 @@ mod tests {
             .route(
                 "/repositories/{workspace}/{repo}/pullrequests",
                 post(create_pr_handler),
+            )
+            .route(
+                "/repositories/{workspace}/{repo}/pullrequests/{pr_id}/merge",
+                post(merge_pr_handler),
             )
             .route(
                 "/repositories/{workspace}/{repo}/src",
@@ -4507,6 +4576,201 @@ mod tests {
         assert_eq!(upstream["title"], "PR title");
 
         std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_merge_pull_request_allowed_and_audited() {
+        let (port, _captured, bodies) = mock_bitbucket_server().await;
+        let (config, audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_merge_pull_request".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: Some(AuditLog::new(audit_path.clone())),
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_merge_pull_request",
+                json!({
+                    "repo_slug": "my-repo",
+                    "pull_request_id": "42",
+                    "close_source_branch": false
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(json["result"]["structuredContent"]["state"], "MERGED");
+
+        let upstream_body = bodies.lock().unwrap().pop().unwrap();
+        let upstream: Value = serde_json::from_str(&upstream_body).unwrap();
+        assert_eq!(upstream["merge_strategy"], "merge_commit");
+        assert_eq!(upstream["close_source_branch"], false);
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"result\":\"attempt\""));
+        assert!(lines[1].contains("\"result\":\"success\""));
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_merge_pull_request_defaults_close_source_branch_to_true() {
+        let (port, _captured, bodies) = mock_bitbucket_server().await;
+        let (config, audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_merge_pull_request".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: Some(AuditLog::new(audit_path.clone())),
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_merge_pull_request",
+                json!({"repo_slug": "my-repo", "pull_request_id": "7"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let upstream_body = bodies.lock().unwrap().pop().unwrap();
+        let upstream: Value = serde_json::from_str(&upstream_body).unwrap();
+        assert_eq!(upstream["merge_strategy"], "merge_commit");
+        assert_eq!(upstream["close_source_branch"], true);
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_merge_pull_request_write_disabled_returns_calltool_error() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let (config, _audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_merge_pull_request".into()],
+            false,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_merge_pull_request",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("write tools not enabled for agent"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_merge_pull_request_invalid_id_returns_400() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let (config, _audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_merge_pull_request".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_merge_pull_request",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42abc"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_merge_pull_request_allowlist_blocks_repo() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let mut config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["allowed-repo".into()],
+        );
+        config.agents[0].enable_writes = Some(true);
+        config.agents[0].tools = vec!["bitbucket_merge_pull_request".into()];
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_merge_pull_request",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not permitted by agent policy"));
     }
 
     #[tokio::test]

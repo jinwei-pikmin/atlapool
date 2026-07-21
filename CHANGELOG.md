@@ -6,10 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- Bitbucket browse tools:
-  - `bitbucket_list_branches`
-  - `bitbucket_list_directory`
-  - `bitbucket_get_file_content`
+- Bitbucket tools:
+  - Browse: `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`
+  - Write: `bitbucket_merge_pull_request` (merge_commit strategy, optional `close_source_branch`)
 - MCP protocol completeness:
   - `initialize` handshake (no key required)
   - `tools/list` returning per-agent allowed tools with JSON Schema `inputSchema`

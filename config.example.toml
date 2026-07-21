@@ -119,7 +119,7 @@ enabled = false
 #   bitbucket_get_repo, bitbucket_get_pull_request,
 #   bitbucket_list_branches, bitbucket_list_directory, bitbucket_get_file_content,
 #   bitbucket_create_repo, bitbucket_create_branch, bitbucket_create_commit,
-#   bitbucket_create_pull_request
+#   bitbucket_create_pull_request, bitbucket_merge_pull_request
 # tools = ["jira_get_issue", "jira_create_issue", "jira_add_comment",
 #          "jira_update_issue", "jira_get_transitions", "jira_transition_issue",
 #          "confluence_get_page", "confluence_create_page", "confluence_update_page",
@@ -127,14 +127,15 @@ enabled = false
 #          "bitbucket_list_branches", "bitbucket_list_directory",
 #          "bitbucket_get_file_content",
 #          "bitbucket_create_repo", "bitbucket_create_branch",
-#          "bitbucket_create_commit", "bitbucket_create_pull_request"]
+#          "bitbucket_create_commit", "bitbucket_create_pull_request",
+#          "bitbucket_merge_pull_request"]
 #
 # enable_writes: when true, the agent may call write tools. If omitted, the global
 # [mcp] enable_writes value is used. Setting this explicitly to false overrides a
 # global true. Write tools: jira_create_issue, jira_add_comment, jira_update_issue,
 # jira_transition_issue, confluence_create_page, confluence_update_page,
 # bitbucket_create_repo, bitbucket_create_branch, bitbucket_create_commit,
-# bitbucket_create_pull_request.
+# bitbucket_create_pull_request, bitbucket_merge_pull_request.
 # Read tools such as jira_get_issue, jira_get_transitions, confluence_get_page,
 # bitbucket_get_repo, bitbucket_list_branches, bitbucket_list_directory,
 # bitbucket_get_file_content work when false.
