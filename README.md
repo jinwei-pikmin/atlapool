@@ -331,6 +331,12 @@ includes the `Mcp-Protocol-Version` header (as standard MCP clients such as
 For non-2xx upstream responses, the same header triggers a `CallToolResult`
 with `isError: true` instead of a JSON-RPC-level error object.
 
+Policy denials (allowlist or write-gate) also return `200 OK` with a
+`CallToolResult` where `isError` is `true`. This prevents MCP bridges such as
+`mcp-remote` from interpreting `403 Forbidden` as an OAuth re-authentication
+trigger. Authentication failures still return `401`, and invalid parameters or
+unknown tools still return `400`.
+
 Example `tools/call` envelope:
 
 ```json
