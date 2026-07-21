@@ -27,13 +27,11 @@ Issue #68 要求補齊這兩個方法，並為目前全部約 18 支工具定義
 
 ### `tools/call` 與標準 MCP client 的相容性
 
-- atlapool 原有的 `tools/call` 把上游 JSON 直接當 `result` 回傳，這對 curl/手工 JSON-RPC 友善，但標準 MCP client（如 `rmcp`）的 `call_tool()` 預期收到 `CallToolResult`（`content` + `isError` + `structuredContent`）。
-- 偵測 `Mcp-Protocol-Version` HTTP header：
-  - 當該 header 存在時，`tools/call` 把上游回應與本地 policy 拒絕都包裝成 `CallToolResult`；
-    - 2xx 回應：`isError: false`，`structuredContent` 為上游 JSON object，`content[0].text` 為其 JSON 字串；純文字或非 JSON 時 `content[0].text` 為原始文字，`structuredContent` 省略；204/空回應時 `structuredContent` 為 `{}`。
-    - 非 2xx 回應：`isError: true`，`structuredContent` 為上游 error body。
-    - policy 拒絕（allowlist 擋、write-gate 擋）：回傳 HTTP 200 + `CallToolResult{isError: true}`，而不是 HTTP 403。避免外部 MCP 橋接工具（如 `mcp-remote`）把 403 誤判為 OAuth 需要重新驗證。401（認證失敗）與 400（參數/未知工具）維持不變。
-  - 無該 header 時保持既有直穿格式與 JSON-RPC error 格式。
+- 標準 MCP client（如 `rmcp`）的 `call_tool()` 預期收到 `CallToolResult`（`content` + `isError` + `structuredContent`）。
+- `tools/call` 無條件把上游回應與本地 policy 拒絕都包裝成 `CallToolResult`，不再根據 `Mcp-Protocol-Version` header 切換格式。
+  - 2xx 回應：`isError: false`，`structuredContent` 為上游 JSON object，`content[0].text` 為其 JSON 字串；純文字或非 JSON 時 `content[0].text` 為原始文字，`structuredContent` 省略；204/空回應時 `structuredContent` 為 `{}`。
+  - 非 2xx 回應：`isError: true`，`structuredContent` 為上游 error body，HTTP status 仍為 200。
+  - policy 拒絕（allowlist 擋、write-gate 擋）：回傳 HTTP 200 + `CallToolResult{isError: true}`，而不是 HTTP 403。避免外部 MCP 橋接工具（如 `mcp-remote`）把 403 誤判為 OAuth 需要重新驗證。401（認證失敗）與 400（參數/未知工具）維持不變。
 
 ### `tools/list`
 
@@ -59,7 +57,7 @@ Issue #68 要求補齊這兩個方法，並為目前全部約 18 支工具定義
 - `mcp.rs` 的 `mcp_handler` 需要重構：先解析 JSON-RPC request，再根據 `method` 分派。
 - 新增 `initialize_handler`、`tools_list_handler`、工具 schema 產生邏輯。
 - 增加 `POST /mcp/notify` 路由，統一處理 MCP 通知類方法。
-- `tools/call` 根據 `Mcp-Protocol-Version` header 決定是否包裝成 `CallToolResult`。
+- `tools/call` 無條件回傳 `CallToolResult`，並同步更新文件與範例。
 - README 與 `config.example.toml` 需說明 `/mcp` 支援 `initialize`/`tools/list`/`tools/call`。
 - 需要新增測試：initialize 無 key、tools/list 認證與過濾、完整的 `initialize` → `tools/list` → `tools/call` 流程，並使用官方 `rmcp` client library 驗證。
 
@@ -68,5 +66,5 @@ Issue #68 要求補齊這兩個方法，並為目前全部約 18 支工具定義
 - `initialize` 不驗證 key，但這符合 MCP 慣例；`tools/list`/`tools/call` 仍保持原有認證。
 - `tools/list` 只按 `tools` allowlist 過濾，不檢查 `projects`/`spaces`/`bitbucket_*` 等維度，因此可能列出 caller 實際無法呼叫維度的工具；這與 Issue 規格一致，但在維度 allowlist 過嚴時會讓工具列表「過寬」。
 - 工具 schema 必須與 `resolve_target` 的參數檢查保持一致，未來新增工具時要同步更新。
-- `tools/call` 對 `Mcp-Protocol-Version` header 的偵測是一種權宜的內容協商機制。若未來需要統一回傳格式，應全面改為 `CallToolResult` 並同步更新文件與範例。
+- `tools/call` 全面改用 `CallToolResult`；curl/手工 JSON-RPC caller 需要從 `result.content[0].text` 或 `result.structuredContent` 讀取上游內容，與舊行為不相容。
 - policy 拒絕不再回 HTTP 403，可能讓只檢查 HTTP status 的舊 client 誤以為請求成功；但對標準 MCP client 而言這是正確行為（`isError: true` 才是 tool-level 錯誤）。

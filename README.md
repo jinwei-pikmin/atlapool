@@ -272,13 +272,20 @@ curl -s -X POST http://localhost:8080/mcp \
   }'
 ```
 
-Expected successful response (the `result` object is the upstream Jira JSON):
+Expected successful response (`result` is a standard MCP `CallToolResult`;
+the upstream Jira JSON is available in `structuredContent`):
 
 ```json
 {
   "jsonrpc": "2.0",
   "id": 1,
-  "result": { "id": "10000", "key": "PROJ-123", ... }
+  "result": {
+    "content": [
+      { "type": "text", "text": "{\"id\":\"10000\",\"key\":\"PROJ-123\",...}" }
+    ],
+    "isError": false,
+    "structuredContent": { "id": "10000", "key": "PROJ-123", ... }
+  }
 }
 ```
 
@@ -311,10 +318,7 @@ Then use the same `curl` commands as above.
 - `tools/list` — returns the agent's allowed tools with `inputSchema`.
 - `tools/call` — invokes a tool with arguments.
 
-`tools/call` returns the upstream JSON directly by default. When the request
-includes the `Mcp-Protocol-Version` header (as standard MCP clients such as
-`rmcp` do after initialization), the upstream response is wrapped in a standard
-`CallToolResult`:
+`tools/call` always returns a standard MCP `CallToolResult`:
 
 ```json
 {
@@ -328,8 +332,8 @@ includes the `Mcp-Protocol-Version` header (as standard MCP clients such as
 }
 ```
 
-For non-2xx upstream responses, the same header triggers a `CallToolResult`
-with `isError: true` instead of a JSON-RPC-level error object.
+For non-2xx upstream responses, the `result` has `isError: true` and
+`structuredContent` contains the upstream error body.
 
 Policy denials (allowlist or write-gate) also return `200 OK` with a
 `CallToolResult` where `isError` is `true`. This prevents MCP bridges such as
