@@ -191,11 +191,7 @@ pub async fn mcp_handler(
             tool = %params.name,
             "rejected request: agent policy denies tool"
         );
-        return mcp_error(
-            request.id,
-            StatusCode::FORBIDDEN,
-            "not permitted by agent policy",
-        );
+        return mcp_policy_error(request.id, "not permitted by agent policy");
     }
 
     // Write gate: conservative classification. Anything that is not a read prefix
@@ -211,11 +207,7 @@ pub async fn mcp_handler(
             tool = %params.name,
             "rejected request: write tools not enabled for agent"
         );
-        return mcp_error(
-            request.id,
-            StatusCode::FORBIDDEN,
-            "write tools not enabled for agent",
-        );
+        return mcp_policy_error(request.id, "write tools not enabled for agent");
     }
 
     // Fail-closed audit: write operations must be logged before the upstream call.
@@ -541,6 +533,15 @@ fn mcp_error(id: Option<Value>, status: StatusCode, message: &str) -> (StatusCod
         "error": { "code": -32000, "message": message }
     });
     (status, Json(body))
+}
+
+fn mcp_policy_error(id: Option<Value>, message: &str) -> (StatusCode, Json<Value>) {
+    let result = json!({
+        "content": [{"type": "text", "text": message}],
+        "isError": true,
+        "structuredContent": { "message": message }
+    });
+    mcp_success(id, result)
 }
 
 async fn initialize_handler(id: Option<Value>) -> (StatusCode, Json<Value>) {
@@ -2244,7 +2245,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -2269,7 +2280,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -2362,7 +2383,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -2546,7 +2577,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -2574,7 +2615,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -2966,7 +3017,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -2991,7 +3052,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -3119,7 +3190,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -3144,7 +3225,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -3223,7 +3314,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -3382,7 +3483,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -3417,7 +3528,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -3634,7 +3755,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -3671,7 +3802,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -3998,7 +4139,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -4204,7 +4355,17 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text == "not permitted by agent policy" || text == "write tools not enabled for agent",
+            "unexpected policy denial message: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -4960,5 +5121,83 @@ mod tests {
             .structured_content
             .expect("expected structured content");
         assert_eq!(structured["key"], "PROJ-123");
+    }
+
+    #[tokio::test]
+    async fn mcp_real_client_policy_denials_return_calltool_error() {
+        use axum::http::{HeaderName, HeaderValue};
+        use rmcp::model::CallToolRequestParams;
+        use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+        use rmcp::transport::StreamableHttpClientTransport;
+        use rmcp::ServiceExt;
+
+        let (port, _captured) = mock_jira_server().await;
+        let mut config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        config.agents[0].tools = vec!["jira_get_issue".into(), "jira_add_comment".into()];
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut custom_headers = std::collections::HashMap::new();
+        custom_headers.insert(
+            HeaderName::from_static("x-atlapool-key"),
+            HeaderValue::from_static("agent-key"),
+        );
+
+        let transport_config = StreamableHttpClientTransportConfig::with_uri(format!(
+            "http://127.0.0.1:{}/mcp",
+            server_port
+        ))
+        .custom_headers(custom_headers);
+
+        let transport = StreamableHttpClientTransport::from_config(transport_config);
+        let client = ().serve(transport).await.unwrap();
+
+        // allowlist denial: jira_create_issue is not in the agent's tool list.
+        let create_args = serde_json::json!({"project": "PROJ", "summary": "New issue"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let create_result = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("jira_create_issue").with_arguments(create_args))
+            .await
+            .unwrap();
+        assert_eq!(create_result.is_error, Some(true));
+        let create_text = &create_result.content[0].as_text().unwrap().text;
+        assert!(create_text.contains("not permitted by agent policy"));
+
+        // write-gate denial: writes are disabled for the agent.
+        let comment_args = serde_json::json!({
+            "issue_key": "PROJ-123",
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [{"type": "paragraph", "content": [{"type": "text", "text": "hi"}]}]
+            }
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let comment_result = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("jira_add_comment").with_arguments(comment_args))
+            .await
+            .unwrap();
+        assert_eq!(comment_result.is_error, Some(true));
+        let comment_text = &comment_result.content[0].as_text().unwrap().text;
+        assert!(comment_text.contains("write tools not enabled for agent"));
     }
 }
