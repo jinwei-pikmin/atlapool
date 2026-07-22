@@ -80,7 +80,7 @@ Request flow for `POST /mcp`:
 
 | Milestone | Status | Highlights |
 |---|---|---|
-| **v0.1** | ✅ Complete | 12 MCP tools for Jira, Confluence, and Bitbucket (read + write); write-gate; fail-closed pre-flight `attempt` audit logging + post-flight `result` records; per-agent allowlists; `env` / AWS / GCP secret resolution; Bitbucket OAuth client credentials with cached, auto-refreshed short-lived tokens; `/health` and `/stats` endpoints. |
+| **v0.1** | ✅ Complete | 30 MCP tools for Jira, Confluence, and Bitbucket (read + write); JQL search with project sandbox and parenthesis/keyword guards; raw diff redaction/truncation; write-gate; fail-closed pre-flight `attempt` audit logging + post-flight `result` records; per-agent allowlists; `env` / AWS / GCP secret resolution; Bitbucket OAuth client credentials with cached, auto-refreshed short-lived tokens; `/health` and `/stats` endpoints. |
 | **v0.2** | 📋 Planned | Per-repo scoped short-lived token minting for Bitbucket. |
 
 ## How clients use it
