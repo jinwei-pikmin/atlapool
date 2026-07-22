@@ -843,6 +843,20 @@ fn all_tools() -> Vec<Tool> {
                 "additionalProperties": false
             }),
         },
+        Tool {
+            name: "bitbucket_add_pull_request_comment",
+            description: "Add a comment to a Bitbucket pull request.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "pull_request_id": { "type": "string", "description": "Numeric pull request ID" },
+                    "content": { "type": "string", "description": "Comment content in raw markdown" }
+                },
+                "required": ["repo_slug", "pull_request_id", "content"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -1533,6 +1547,40 @@ fn resolve_target(
                     "/repositories/{workspace}/{repo_slug}/refs/branches/{encoded_branch}"
                 ),
                 body: RequestBody::None,
+                update: None,
+                resolve_ref: None,
+            })
+        }
+        "bitbucket_add_pull_request_comment" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let pull_request_id = args
+                .get("pull_request_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing pull_request_id")?;
+            if pull_request_id.is_empty() || !pull_request_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err("pull_request_id must be a non-empty numeric id".into());
+            }
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or("missing content")?;
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            let body = json!({
+                "content": { "raw": content }
+            });
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::POST,
+                path: format!("/repositories/{workspace}/{repo_slug}/pullrequests/{pull_request_id}/comments"),
+                body: RequestBody::json(body),
                 update: None,
                 resolve_ref: None,
             })
@@ -4148,6 +4196,22 @@ mod tests {
                 }))
             };
 
+        let add_pr_comment_handler =
+            |State(s): State<MockState>,
+             Path((workspace, repo, pr_id)): Path<(String, String, String)>,
+             headers: HeaderMap,
+             body: String| async move {
+                s.headers.lock().unwrap().push(headers);
+                s.bodies.lock().unwrap().push(body);
+                Json(json!({
+                    "id": 123,
+                    "pullrequest": { "id": pr_id, "title": "PR title" },
+                    "content": { "raw": "comment body" },
+                    "user": { "nickname": "atlapool-bot" },
+                    "repository": { "full_name": format!("{workspace}/{repo}") }
+                }))
+            };
+
         let create_commit_handler = |State(s): State<MockState>,
                                      Path((workspace, repo)): Path<(String, String)>,
                                      headers: HeaderMap,
@@ -4184,6 +4248,10 @@ mod tests {
             .route(
                 "/repositories/{workspace}/{repo}/pullrequests/{pr_id}/decline",
                 post(decline_pr_handler),
+            )
+            .route(
+                "/repositories/{workspace}/{repo}/pullrequests/{pr_id}/comments",
+                post(add_pr_comment_handler),
             )
             .route(
                 "/repositories/{workspace}/{repo}/refs/branches/{*branch_name}",
@@ -5146,6 +5214,176 @@ mod tests {
             .oneshot(build_request(
                 "bitbucket_delete_branch",
                 json!({"repo_slug": "my-repo", "branch_name": "feature/x"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not permitted by agent policy"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_add_pull_request_comment_allowed_and_audited_without_content() {
+        let (port, _captured, bodies) = mock_bitbucket_server().await;
+        let (config, audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_add_pull_request_comment".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: Some(AuditLog::new(audit_path.clone())),
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_add_pull_request_comment",
+                json!({
+                    "repo_slug": "my-repo",
+                    "pull_request_id": "42",
+                    "content": "LGTM, please merge"
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(
+            json["result"]["structuredContent"]["pullrequest"]["id"],
+            "42"
+        );
+
+        let upstream_body = bodies.lock().unwrap().pop().unwrap();
+        let upstream: Value = serde_json::from_str(&upstream_body).unwrap();
+        assert_eq!(upstream["content"]["raw"], "LGTM, please merge");
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(!log.contains("LGTM, please merge"));
+        assert!(log.contains("\"target\":\"WORK\""));
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_add_pull_request_comment_write_disabled_returns_calltool_error() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let (config, _audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_add_pull_request_comment".into()],
+            false,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_add_pull_request_comment",
+                json!({
+                    "repo_slug": "my-repo",
+                    "pull_request_id": "42",
+                    "content": "nope"
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("write tools not enabled for agent"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_add_pull_request_comment_invalid_id_returns_400() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let (config, _audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_add_pull_request_comment".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_add_pull_request_comment",
+                json!({
+                    "repo_slug": "my-repo",
+                    "pull_request_id": "42abc",
+                    "content": "hi"
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_add_pull_request_comment_allowlist_blocks_repo() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let mut config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["allowed-repo".into()],
+        );
+        config.agents[0].enable_writes = Some(true);
+        config.agents[0].tools = vec!["bitbucket_add_pull_request_comment".into()];
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_add_pull_request_comment",
+                json!({
+                    "repo_slug": "my-repo",
+                    "pull_request_id": "42",
+                    "content": "hi"
+                }),
                 Some("agent-key"),
             ))
             .await
