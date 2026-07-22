@@ -980,11 +980,16 @@ optionally `AND (<jql_filter>)`). The `project` argument is also checked against
 the agent's `projects` allowlist before any upstream call.
 
 To prevent `jql_filter` from trying to override the project scope, the filter is
-rejected (400) if it contains the tokens `project` or `projectKey` (case-
-insensitive). This is a lightweight keyword blacklist rather than a full JQL
-parser: it blocks the common bypass path without over-engineering the parser,
-but it may reject filters that merely mention the word "project" in a string
-value.
+rejected (400) if:
+
+- It contains the tokens `project` or `projectKey` (case-insensitive).
+- Its parentheses are unbalanced, which could break the outer `AND (...)`
+  wrapper (e.g. `1=1) OR (1=1`).
+
+This is a lightweight keyword blacklist plus a simple parenthesis scan, not a
+full JQL parser: it blocks the common bypass paths without over-engineering the
+parser, but it may reject filters that merely mention the word "project" in a
+string value.
 
 Audit guarantee:
 

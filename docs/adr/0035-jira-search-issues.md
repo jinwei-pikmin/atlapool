@@ -34,13 +34,22 @@ project = "{project}"
 
 這確保上游 JQL 一定以 project 範圍開頭，`jql_filter` 無法覆寫或繞過 allowlist。
 
+### 括號平衡檢查
+
+`jql_filter` 在與 `project = "..."` 包裝時會被放入一對括號：`project = "..." AND ({jql_filter})`。為防止利用不對稱括號破壞這層包裝（例如 `1=1) OR (1=1` 會讓最外層括號提前關閉，導致 `AND` 後面的條件逃逸到 `OR` 之外），`resolve_target()` 會掃描 `jql_filter` 的括號：
+
+- 任何時候 `)` 的數量不能超過 `(` 的數量（前綴不可出現未配對的右括號）。
+- 掃描結束時 `(` 與 `)` 數量必須相等。
+
+這是簡單的括號平衡檢查，不是完整 JQL 解析，但可擋住本次發現的 `1=1) OR (1=1` 繞過 payload。
+
 ### 關鍵字黑名單
 
 為防止 `jql_filter` 內夾帶 `project = ...` 或 `projectKey = ...` 試圖改變範圍，`resolve_target()` 先對 `jql_filter` 做大小寫不敏感的字級比對：若包含 `project` 或 `projectkey` 這兩個 token，直接 400 拒絕，不送上游。
 
 實作使用 regex `\b(project|projectkey)\b`（case-insensitive）。這不是完整 JQL 語法解析，但能以較低成本堵住主要繞過路徑。
 
-> 限制：此黑名單仍可能誤判字面值（如 `text ~ "project"`），或漏過高級編碼繞過。使用者輸入仍應視為不可信。
+> 限制：黑名單與括號平衡仍可能誤判字面值（如 `text ~ "project"`），或漏過高級編碼繞過。使用者輸入仍應視為不可信。
 
 ### 呼叫 Jira REST API
 

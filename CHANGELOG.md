@@ -8,6 +8,14 @@ All notable changes to this project will be documented in this file.
 
 - Jira tools:
   - Read: `jira_search_issues` with forced `project = "..."` JQL prefix, `project`/`projectKey` keyword blacklist, and `max_results` clamping
+
+### Fixed
+
+- `jira_search_issues`: reject `jql_filter` with unbalanced parentheses to prevent bypassing the forced `project = "..."` wrapper (e.g. `1=1) OR (1=1`)
+
+### Added
+
+- Jira tools:
   - Read: `jira_list_comments`
 - Confluence tools:
   - Read: `confluence_get_page` now supports lookup by `space` + `title` in addition to `page_id`
