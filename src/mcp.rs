@@ -676,6 +676,11 @@ fn process_diff_body(bytes: Bytes, max_lines: usize) -> Value {
     result
 }
 
+fn jql_project_override_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)\b(project|projectkey)\b").unwrap())
+}
+
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 fn wrap_calltool_result(upstream_body: &Value, is_error: bool) -> Value {
@@ -839,6 +844,20 @@ fn all_tools() -> Vec<Tool> {
                     "transition_id": { "type": "string", "description": "Numeric transition id" }
                 },
                 "required": ["issue_key", "transition_id"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "jira_search_issues",
+            description: "Search Jira issues within a project using JQL.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "description": "Jira project key (required, must be in allowlist)" },
+                    "jql_filter": { "type": "string", "description": "Optional additional JQL condition; cannot contain project/projectKey tokens" },
+                    "max_results": { "type": "number", "description": "Maximum results (default 50, capped at 100)" }
+                },
+                "required": ["project"],
                 "additionalProperties": false
             }),
         },
@@ -2110,6 +2129,56 @@ fn resolve_target(
                 max_lines: None,
             })
         }
+        "jira_search_issues" => {
+            let args = args.ok_or("missing arguments")?;
+            let project = args
+                .get("project")
+                .and_then(|v| v.as_str())
+                .ok_or("missing project")?;
+            if project.is_empty() {
+                return Err("project must not be empty".into());
+            }
+
+            let jql_filter = args.get("jql_filter").and_then(|v| v.as_str());
+            if let Some(filter) = jql_filter {
+                if jql_project_override_regex().is_match(filter) {
+                    return Err("jql_filter must not contain project or projectKey tokens".into());
+                }
+            }
+
+            let max_results = args
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(50)
+                .min(100);
+
+            let jql = if let Some(filter) = jql_filter {
+                if filter.trim().is_empty() {
+                    format!("project = \"{project}\"")
+                } else {
+                    format!("project = \"{project}\" AND ({filter})")
+                }
+            } else {
+                format!("project = \"{project}\"")
+            };
+
+            Ok(ToolTarget {
+                workspace: None,
+                repo: None,
+                project: Some(project.to_string()),
+                space: None,
+                method: Method::POST,
+                path: "/rest/api/3/search".into(),
+                body: RequestBody::json(json!({
+                    "jql": jql,
+                    "maxResults": max_results,
+                })),
+                update: None,
+                resolve_ref: None,
+                max_lines: None,
+            })
+        }
         _ => Err("unsupported tool".into()),
     }
 }
@@ -2343,6 +2412,7 @@ mod tests {
                     "jira_update_issue".into(),
                     "jira_get_transitions".into(),
                     "jira_transition_issue".into(),
+                    "jira_search_issues".into(),
                 ],
                 projects: vec!["PROJ".into()],
                 spaces: vec![],
@@ -2584,6 +2654,25 @@ mod tests {
             }))
         };
 
+        let search_handler = |State(s): State<MockState>, headers: HeaderMap, body: Bytes| async move {
+            s.headers.lock().unwrap().push(headers);
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_default();
+            Json(json!({
+                "expand": "names,schema",
+                "startAt": 0,
+                "maxResults": payload["maxResults"],
+                "total": 1,
+                "issues": [
+                    {
+                        "id": "10000",
+                        "key": "PROJ-123",
+                        "fields": { "summary": "Test issue" }
+                    }
+                ],
+                "jql": payload["jql"]
+            }))
+        };
+
         let app = Router::new()
             .route(
                 "/rest/api/3/issue/{key}",
@@ -2595,6 +2684,7 @@ mod tests {
                 "/rest/api/3/issue/{key}/transitions",
                 get(get_transitions_handler).post(do_transition_handler),
             )
+            .route("/rest/api/3/search", post(search_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3839,6 +3929,129 @@ mod tests {
             "unexpected policy denial message: {}",
             text
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_search_issues_uses_forced_project_prefix() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_search_issues",
+                json!({"project": "PROJ", "jql_filter": "status = \"In Progress\"", "max_results": 10}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        let jql = json["result"]["structuredContent"]["jql"].as_str().unwrap();
+        assert!(jql.starts_with("project = \"PROJ\" AND"));
+        assert!(jql.contains("status = \"In Progress\""));
+        assert_eq!(json["result"]["structuredContent"]["maxResults"], 10);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_search_issues_rejects_project_override_in_filter() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_search_issues",
+                json!({"project": "PROJ", "jql_filter": "project = \"OTHER\""}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_search_issues_clamps_max_results() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_search_issues",
+                json!({"project": "PROJ", "max_results": 500}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(json["result"]["structuredContent"]["maxResults"], 100);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_search_issues_forbidden_project_returns_policy_error() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_search_issues",
+                json!({"project": "OTHER"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not permitted by agent policy"));
     }
 
     #[tokio::test]
