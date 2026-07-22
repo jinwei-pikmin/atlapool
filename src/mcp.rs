@@ -262,6 +262,22 @@ pub async fn mcp_handler(
                 "confluence upstream not configured",
             );
         };
+
+        // confluence_get_page by title needs a title-to-page-id lookup before
+        // fetching the full page body.
+        if params.name == "confluence_get_page" && target.path.starts_with("/wiki/api/v2/spaces/") {
+            match resolve_confluence_page_by_title(confluence, &target.path).await {
+                Ok(ConfluenceTitleResult::Found(page_id)) => {
+                    target.path = format!("/wiki/api/v2/pages/{page_id}?body-format=view");
+                }
+                Ok(ConfluenceTitleResult::NotFound(message))
+                | Ok(ConfluenceTitleResult::Multiple(message)) => {
+                    return mcp_policy_error(request.id, &message);
+                }
+                Err((status, message)) => return mcp_error(request.id, status, &message),
+            }
+        }
+
         forward(
             confluence,
             audit,
@@ -862,15 +878,30 @@ fn all_tools() -> Vec<Tool> {
             }),
         },
         Tool {
-            name: "confluence_get_page",
-            description: "Fetch a Confluence page by ID.",
+            name: "jira_list_comments",
+            description: "List comments on a Jira issue.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "page_id": { "type": "string", "description": "Numeric page ID" },
-                    "space": { "type": "string", "description": "Space key for allowlist" }
+                    "issue_key": { "type": "string", "description": "Issue key, e.g. PROJ-123" }
                 },
-                "required": ["page_id", "space"],
+                "required": ["issue_key"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "confluence_get_page",
+            description: "Fetch a Confluence page by ID or by space + title.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "space": { "type": "string", "description": "Space key for allowlist" },
+                    "page_id": { "type": "string", "description": "Numeric page ID (use either page_id or title)" },
+                    "space_id": { "type": "string", "description": "Numeric space ID (required with title)" },
+                    "title": { "type": "string", "description": "Page title to look up in the space (use with space_id)" }
+                },
+                "required": ["space"],
+                "minProperties": 2,
                 "additionalProperties": false
             }),
         },
@@ -1313,25 +1344,51 @@ fn resolve_target(
             if space.is_empty() {
                 return Err("space must not be empty".into());
             }
-            let page_id = args
-                .get("page_id")
-                .and_then(|v| v.as_str())
-                .ok_or("missing page_id")?;
-            if page_id.is_empty() || !page_id.chars().all(|c| c.is_ascii_digit()) {
-                return Err("page_id must be a non-empty numeric id".into());
+
+            let page_id = args.get("page_id").and_then(|v| v.as_str());
+            let title = args.get("title").and_then(|v| v.as_str());
+            let space_id = args.get("space_id").and_then(|v| v.as_str());
+
+            if let Some(page_id) = page_id {
+                if page_id.is_empty() || !page_id.chars().all(|c| c.is_ascii_digit()) {
+                    return Err("page_id must be a non-empty numeric id".into());
+                }
+                Ok(ToolTarget {
+                    workspace: None,
+                    repo: None,
+                    project: None,
+                    space: Some(space),
+                    method: Method::GET,
+                    path: format!("/wiki/api/v2/pages/{page_id}?body-format=view"),
+                    body: RequestBody::None,
+                    update: None,
+                    resolve_ref: None,
+                    max_lines: None,
+                })
+            } else if let Some(title) = title {
+                let space_id = space_id.ok_or("missing space_id for title lookup")?;
+                if space_id.is_empty() || !space_id.chars().all(|c| c.is_ascii_digit()) {
+                    return Err("space_id must be a non-empty numeric id".into());
+                }
+                if title.is_empty() {
+                    return Err("title must not be empty".into());
+                }
+                let encoded_title = urlencoding::encode(title);
+                Ok(ToolTarget {
+                    workspace: None,
+                    repo: None,
+                    project: None,
+                    space: Some(space),
+                    method: Method::GET,
+                    path: format!("/wiki/api/v2/spaces/{space_id}/pages?title={encoded_title}"),
+                    body: RequestBody::None,
+                    update: None,
+                    resolve_ref: None,
+                    max_lines: None,
+                })
+            } else {
+                Err("either page_id or title (with space_id) must be provided".into())
             }
-            Ok(ToolTarget {
-                workspace: None,
-                repo: None,
-                project: None,
-                space: Some(space),
-                method: Method::GET,
-                path: format!("/wiki/api/v2/pages/{page_id}?body-format=view"),
-                body: RequestBody::None,
-                update: None,
-                resolve_ref: None,
-                max_lines: None,
-            })
         }
         "confluence_create_page" => {
             let args = args.ok_or("missing arguments")?;
@@ -2265,6 +2322,27 @@ fn resolve_target(
                 max_lines: None,
             })
         }
+        "jira_list_comments" => {
+            let args = args.ok_or("missing arguments")?;
+            let issue_key = args
+                .get("issue_key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing issue_key")?;
+            valid_issue_key(issue_key)?;
+            let project = issue_key.split_once('-').map(|(p, _)| p.to_string());
+            Ok(ToolTarget {
+                workspace: None,
+                repo: None,
+                project,
+                space: None,
+                method: Method::GET,
+                path: format!("/rest/api/3/issue/{issue_key}/comment"),
+                body: RequestBody::None,
+                update: None,
+                resolve_ref: None,
+                max_lines: None,
+            })
+        }
         _ => Err("unsupported tool".into()),
     }
 }
@@ -2300,6 +2378,72 @@ fn build_bitbucket_src_path(
         path.push('/');
     }
     path
+}
+
+enum ConfluenceTitleResult {
+    Found(String),
+    NotFound(String),
+    Multiple(String),
+}
+
+/// Resolve a Confluence page title to a single page ID.
+///
+/// `list_path` must be `/wiki/api/v2/spaces/{space_id}/pages?title={encoded_title}`.
+async fn resolve_confluence_page_by_title<C: UpstreamClient>(
+    client: &C,
+    list_path: &str,
+) -> Result<ConfluenceTitleResult, (StatusCode, String)> {
+    let request = client
+        .build_request(Method::GET, list_path, RequestBody::None)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let response = client.execute(request).await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("upstream GET failed: {}", e),
+        )
+    })?;
+    if !response.status().is_success() {
+        return Err((
+            StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            format!("upstream GET returned {}", response.status()),
+        ));
+    }
+    let body: Value = response.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to parse upstream GET response: {}", e),
+        )
+    })?;
+    let results = body
+        .get("results")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "upstream response did not contain a results array".into(),
+            )
+        })?;
+    match results.len() {
+        0 => Ok(ConfluenceTitleResult::NotFound(
+            "no Confluence page found with the given title".into(),
+        )),
+        1 => {
+            let page_id = results[0]
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        "upstream page result missing id".into(),
+                    )
+                })?;
+            Ok(ConfluenceTitleResult::Found(page_id.to_string()))
+        }
+        _ => Ok(ConfluenceTitleResult::Multiple(
+            "multiple Confluence pages found with the given title; please use page_id".into(),
+        )),
+    }
 }
 
 /// Build the upstream PUT body for `jira_update_issue`.
@@ -2499,6 +2643,7 @@ mod tests {
                     "jira_get_transitions".into(),
                     "jira_transition_issue".into(),
                     "jira_search_issues".into(),
+                    "jira_list_comments".into(),
                 ],
                 projects: vec!["PROJ".into()],
                 spaces: vec![],
@@ -2761,13 +2906,34 @@ mod tests {
             }))
         };
 
+        let list_comments_handler =
+            |State(s): State<MockState>, Path(_): Path<String>, headers: HeaderMap| async move {
+                s.headers.lock().unwrap().push(headers);
+                Json(json!({
+                    "startAt": 0,
+                    "maxResults": 10,
+                    "total": 1,
+                    "comments": [
+                        {
+                            "id": "10001",
+                            "author": { "displayName": "Alice" },
+                            "body": { "type": "doc", "version": 1, "content": [] },
+                            "created": "2026-01-01T00:00:00.000+0000"
+                        }
+                    ]
+                }))
+            };
+
         let app = Router::new()
             .route(
                 "/rest/api/3/issue/{key}",
                 get(get_handler).put(update_handler),
             )
             .route("/rest/api/3/issue", post(post_handler))
-            .route("/rest/api/3/issue/{key}/comment", post(comment_handler))
+            .route(
+                "/rest/api/3/issue/{key}/comment",
+                get(list_comments_handler).post(comment_handler),
+            )
             .route(
                 "/rest/api/3/issue/{key}/transitions",
                 get(get_transitions_handler).post(do_transition_handler),
@@ -2855,21 +3021,44 @@ mod tests {
 
         let list_handler = |State(s): State<MockState>,
                             Path(space_id): Path<String>,
+                            Query(query): Query<std::collections::HashMap<String, String>>,
                             headers: HeaderMap| async move {
             s.headers.lock().unwrap().push(headers);
-            let has_next = space_id == "999";
-            let mut response = json!({
-                "results": [
-                    { "id": "123", "title": "Page 1", "spaceId": space_id },
-                    { "id": "124", "title": "Page 2", "spaceId": space_id }
-                ],
-                "_links": {
-                    "base": "https://example.atlassian.net/wiki"
+            let title = query.get("title").cloned().unwrap_or_default();
+            let response = if title == "Unique Page" {
+                json!({
+                    "results": [
+                        { "id": "456", "title": "Unique Page", "spaceId": space_id }
+                    ],
+                    "_links": { "base": "https://example.atlassian.net/wiki" }
+                })
+            } else if title == "No Such Page" {
+                json!({
+                    "results": [],
+                    "_links": { "base": "https://example.atlassian.net/wiki" }
+                })
+            } else if title == "Ambiguous" {
+                json!({
+                    "results": [
+                        { "id": "456", "title": "Ambiguous", "spaceId": space_id },
+                        { "id": "457", "title": "Ambiguous", "spaceId": space_id }
+                    ],
+                    "_links": { "base": "https://example.atlassian.net/wiki" }
+                })
+            } else {
+                let has_next = space_id == "999";
+                let mut r = json!({
+                    "results": [
+                        { "id": "123", "title": "Page 1", "spaceId": space_id },
+                        { "id": "124", "title": "Page 2", "spaceId": space_id }
+                    ],
+                    "_links": { "base": "https://example.atlassian.net/wiki" }
+                });
+                if has_next {
+                    r["next"] = json!("/wiki/api/v2/spaces/999/pages?cursor=abc");
                 }
-            });
-            if has_next {
-                response["next"] = json!("/wiki/api/v2/spaces/999/pages?cursor=abc");
-            }
+                r
+            };
             Json(response)
         };
 
@@ -4170,6 +4359,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_jira_list_comments_allowed_and_strips_headers() {
+        let (port, captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_list_comments",
+                json!({"issue_key": "PROJ-123"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        let comments = json["result"]["structuredContent"]["comments"]
+            .as_array()
+            .unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0]["author"]["displayName"], "Alice");
+
+        let upstream_headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            upstream_headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer test-token"
+        );
+        assert!(upstream_headers.get("cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_list_comments_forbidden_project_returns_policy_error() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_list_comments",
+                json!({"issue_key": "OTHER-123"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not permitted by agent policy"));
+    }
+
+    #[tokio::test]
     async fn mcp_confluence_get_page_allows_and_strips_headers() {
         let (port, captured) = mock_confluence_server().await;
         let config = confluence_test_config(
@@ -5013,6 +5280,155 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_get_page_by_title_resolves_and_returns_body() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_get_page",
+                json!({"space": "SPACE", "space_id": "12345", "title": "Unique Page"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(json["result"]["structuredContent"]["id"], "456");
+        assert!(json["result"]["structuredContent"]["body"]["view"]["value"]
+            .as_str()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_get_page_by_title_not_found_returns_calltool_error() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_get_page",
+                json!({"space": "SPACE", "space_id": "12345", "title": "No Such Page"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no Confluence page found"));
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_get_page_by_title_ambiguous_returns_calltool_error() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_get_page",
+                json!({"space": "SPACE", "space_id": "12345", "title": "Ambiguous"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("multiple Confluence pages found"));
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_get_page_by_page_id_still_works() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_get_page",
+                json!({"space": "SPACE", "page_id": "67890"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(json["result"]["structuredContent"]["id"], "67890");
     }
 
     async fn mock_bitbucket_server() -> (u16, Arc<Mutex<Vec<HeaderMap>>>, Arc<Mutex<Vec<String>>>) {
