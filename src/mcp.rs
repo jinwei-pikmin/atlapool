@@ -817,6 +817,32 @@ fn all_tools() -> Vec<Tool> {
                 "additionalProperties": false
             }),
         },
+        Tool {
+            name: "bitbucket_decline_pull_request",
+            description: "Decline a Bitbucket pull request without merging.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "pull_request_id": { "type": "string", "description": "Numeric pull request ID" }
+                },
+                "required": ["repo_slug", "pull_request_id"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "bitbucket_delete_branch",
+            description: "Delete a branch in a Bitbucket repository.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "branch_name": { "type": "string", "description": "Branch name; may contain '/' (e.g. 'feature/x')" }
+                },
+                "required": ["repo_slug", "branch_name"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -860,6 +886,18 @@ fn resolve_target(
         }
         if s.contains('/') {
             return Err("ref must not contain '/'; use a commit hash for branches with '/'".into());
+        }
+        Ok(())
+    };
+    let valid_branch_name = |s: &str| -> Result<(), String> {
+        if s.is_empty() {
+            return Err("branch_name must not be empty".into());
+        }
+        if s == "." || s == ".." {
+            return Err("branch_name must not be '.' or '..'".into());
+        }
+        if s.starts_with('/') {
+            return Err("branch_name must not start with '/'".into());
         }
         Ok(())
     };
@@ -1442,6 +1480,63 @@ fn resolve_target(
                 resolve_ref: None,
             })
         }
+        "bitbucket_decline_pull_request" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let pull_request_id = args
+                .get("pull_request_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing pull_request_id")?;
+            if pull_request_id.is_empty() || !pull_request_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err("pull_request_id must be a non-empty numeric id".into());
+            }
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::POST,
+                path: format!(
+                    "/repositories/{workspace}/{repo_slug}/pullrequests/{pull_request_id}/decline"
+                ),
+                body: RequestBody::None,
+                update: None,
+                resolve_ref: None,
+            })
+        }
+        "bitbucket_delete_branch" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let branch_name = args
+                .get("branch_name")
+                .and_then(|v| v.as_str())
+                .ok_or("missing branch_name")?;
+            valid_branch_name(branch_name)?;
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            let encoded_branch = encode_path_segment(branch_name);
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::DELETE,
+                path: format!(
+                    "/repositories/{workspace}/{repo_slug}/refs/branches/{encoded_branch}"
+                ),
+                body: RequestBody::None,
+                update: None,
+                resolve_ref: None,
+            })
+        }
         "bitbucket_create_repo" => {
             let args = args.ok_or("missing arguments")?;
             let repo_slug = args
@@ -1746,7 +1841,7 @@ mod tests {
     use axum::body::Body;
     use axum::extract::Path;
     use axum::http::{Request, StatusCode};
-    use axum::routing::{get, post};
+    use axum::routing::{delete, get, post};
     use axum::Router;
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
@@ -4028,6 +4123,31 @@ mod tests {
             }))
         };
 
+        let decline_pr_handler =
+            |State(s): State<MockState>,
+             Path((workspace, repo, pr_id)): Path<(String, String, String)>,
+             headers: HeaderMap| async move {
+                s.headers.lock().unwrap().push(headers);
+                Json(json!({
+                    "id": pr_id,
+                    "title": "declined PR",
+                    "state": "DECLINED",
+                    "source": { "repository": { "full_name": format!("{workspace}/{repo}") } }
+                }))
+            };
+
+        let delete_branch_handler =
+            |State(s): State<MockState>,
+             Path((workspace, repo, branch_name)): Path<(String, String, String)>,
+             headers: HeaderMap| async move {
+                s.headers.lock().unwrap().push(headers);
+                Json(json!({
+                    "name": branch_name,
+                    "type": "branch",
+                    "repository": { "full_name": format!("{workspace}/{repo}") }
+                }))
+            };
+
         let create_commit_handler = |State(s): State<MockState>,
                                      Path((workspace, repo)): Path<(String, String)>,
                                      headers: HeaderMap,
@@ -4060,6 +4180,14 @@ mod tests {
             .route(
                 "/repositories/{workspace}/{repo}/pullrequests/{pr_id}/merge",
                 post(merge_pr_handler),
+            )
+            .route(
+                "/repositories/{workspace}/{repo}/pullrequests/{pr_id}/decline",
+                post(decline_pr_handler),
+            )
+            .route(
+                "/repositories/{workspace}/{repo}/refs/branches/{*branch_name}",
+                delete(delete_branch_handler),
             )
             .route(
                 "/repositories/{workspace}/{repo}/src",
@@ -4759,6 +4887,265 @@ mod tests {
             .oneshot(build_request(
                 "bitbucket_merge_pull_request",
                 json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not permitted by agent policy"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_decline_pull_request_allowed_and_audited() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let (config, audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_decline_pull_request".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: Some(AuditLog::new(audit_path.clone())),
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_decline_pull_request",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(json["result"]["structuredContent"]["state"], "DECLINED");
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"result\":\"attempt\""));
+        assert!(lines[1].contains("\"result\":\"success\""));
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_decline_pull_request_write_disabled_returns_calltool_error() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let (config, _audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_decline_pull_request".into()],
+            false,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_decline_pull_request",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("write tools not enabled for agent"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_decline_pull_request_invalid_id_returns_400() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let (config, _audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_decline_pull_request".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_decline_pull_request",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42abc"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_delete_branch_allowed_and_audited_with_slash_encoding() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let (config, audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_delete_branch".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: Some(AuditLog::new(audit_path.clone())),
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_delete_branch",
+                json!({"repo_slug": "my-repo", "branch_name": "feature/x"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(json["result"]["structuredContent"]["name"], "feature/x");
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        let lines: Vec<&str> = log.trim().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"result\":\"attempt\""));
+        assert!(lines[1].contains("\"result\":\"success\""));
+
+        std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_delete_branch_write_disabled_returns_calltool_error() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let (config, _audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_delete_branch".into()],
+            false,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_delete_branch",
+                json!({"repo_slug": "my-repo", "branch_name": "feature/x"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("write tools not enabled for agent"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_delete_branch_rejects_dotdot() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let (config, _audit_path) = bitbucket_write_test_config(
+            format!("http://127.0.0.1:{}", port),
+            vec!["bitbucket_delete_branch".into()],
+            true,
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_delete_branch",
+                json!({"repo_slug": "my-repo", "branch_name": ".."}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_delete_branch_allowlist_blocks_repo() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let mut config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["allowed-repo".into()],
+        );
+        config.agents[0].enable_writes = Some(true);
+        config.agents[0].tools = vec!["bitbucket_delete_branch".into()];
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_delete_branch",
+                json!({"repo_slug": "my-repo", "branch_name": "feature/x"}),
                 Some("agent-key"),
             ))
             .await
