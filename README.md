@@ -367,6 +367,8 @@ Example `tools/call` envelope:
 | `confluence_get_page` | Fetch a Confluence page by ID | `page_id` (numeric page ID), `space` (key for allowlist) | `spaces` | No | No |
 | `confluence_create_page` | Create a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `title`, `body` (storage HTML), optional `parent_id` (numeric page ID) | `spaces` | Yes | Yes |
 | `confluence_update_page` | Update a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `page_id` (numeric ID), `title`, `version`, `body` (storage HTML) | `spaces` | Yes | Yes |
+| `confluence_list_pages` | List pages in a Confluence space | `space` (key for allowlist), `space_id` (numeric ID) | `spaces` | No | No |
+| `confluence_delete_page` | Delete a Confluence page | `space` (key for allowlist), `page_id` (numeric ID) | `spaces` | Yes | Yes |
 | `bitbucket_get_repo` | Fetch a Bitbucket repository | `repo_slug` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_get_pull_request` | Fetch a Bitbucket pull request | `repo_slug`, `pull_request_id` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_get_pipeline_status` | Get latest Bitbucket Pipelines status for a branch | `repo_slug`, `branch` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |

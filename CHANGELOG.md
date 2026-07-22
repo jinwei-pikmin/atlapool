@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 
 - Jira tools:
   - Read: `jira_search_issues` with forced `project = "..."` JQL prefix, `project`/`projectKey` keyword blacklist, and `max_results` clamping
+- Confluence tools:
+  - Read: `confluence_list_pages` with `has_more` pagination hint
+  - Write: `confluence_delete_page` with write-gate and fail-closed audit
 - Bitbucket tools:
   - Browse: `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`, `bitbucket_list_pull_requests` (with `has_more` pagination hint), `bitbucket_list_pull_request_changes` (diffstat only)
   - Read: `bitbucket_get_pipeline_status` with Bitbucket Pipelines state/result normalization
