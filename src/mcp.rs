@@ -2598,7 +2598,7 @@ mod tests {
     use crate::upstream::JiraClient;
     use axum::body::Body;
     use axum::extract::{Path, Query};
-    use axum::http::{Request, StatusCode};
+    use axum::http::{header, Request, StatusCode};
     use axum::routing::{delete, get, post};
     use axum::Router;
     use serde_json::{json, Value};
@@ -5431,6 +5431,55 @@ mod tests {
         assert_eq!(json["result"]["structuredContent"]["id"], "67890");
     }
 
+    async fn mock_bitbucket_and_cdn_servers() -> (u16, u16, Arc<Mutex<Vec<HeaderMap>>>) {
+        #[derive(Clone)]
+        struct CdnState {
+            headers: Arc<Mutex<Vec<HeaderMap>>>,
+        }
+
+        let cdn_state = CdnState {
+            headers: Arc::new(Mutex::new(Vec::new())),
+        };
+        let cdn_captured = cdn_state.headers.clone();
+
+        let cdn_handler = |State(s): State<CdnState>, headers: HeaderMap| async move {
+            s.headers.lock().unwrap().push(headers);
+            (
+                StatusCode::OK,
+                "diff --git a/src/main.rs b/src/main.rs\n+new line\n",
+            )
+        };
+
+        let cdn_app = Router::new()
+            .route("/diff", get(cdn_handler))
+            .with_state(cdn_state);
+        let cdn_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cdn_port = cdn_listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(cdn_listener, cdn_app).await.unwrap() });
+
+        let redirect_handler =
+            move |Path((_workspace, _repo, _pr_id)): Path<(String, String, String)>,
+                  headers: HeaderMap| async move {
+                let _ = headers;
+                let location = format!("http://127.0.0.1:{}/diff", cdn_port);
+                (StatusCode::FOUND, [(header::LOCATION, location)], "")
+            };
+
+        let bitbucket_app = Router::new().route(
+            "/repositories/{workspace}/{repo}/pullrequests/{pr_id}/diff",
+            get(redirect_handler),
+        );
+        let bitbucket_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bitbucket_port = bitbucket_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(bitbucket_listener, bitbucket_app)
+                .await
+                .unwrap()
+        });
+
+        (bitbucket_port, cdn_port, cdn_captured)
+    }
+
     async fn mock_bitbucket_server() -> (u16, Arc<Mutex<Vec<HeaderMap>>>, Arc<Mutex<Vec<String>>>) {
         #[derive(Clone)]
         struct MockState {
@@ -6531,6 +6580,47 @@ index abc..def 100644\n\
         assert_eq!(json["result"]["isError"], true);
         let text = json["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("not permitted by agent policy"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_diff_strips_auth_on_cross_host_redirect() {
+        let (bb_port, _cdn_port, cdn_captured) = mock_bitbucket_and_cdn_servers().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", bb_port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request_diff",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+
+        let cdn_headers = cdn_captured.lock().unwrap().pop().unwrap();
+        assert!(
+            cdn_headers.get("authorization").is_none(),
+            "Authorization header leaked to CDN redirect target"
+        );
     }
 
     #[tokio::test]
