@@ -363,6 +363,7 @@ Example `tools/call` envelope:
 | `jira_update_issue` | Update a Jira issue (summary, assignee, or append description) | `issue_key` and at least one of `summary`, `assignee`, or `description_append` | `projects` (parsed from key) | Yes | Yes |
 | `jira_get_transitions` | List available transitions for a Jira issue | `issue_key` | `projects` (parsed from key) | No | No |
 | `jira_transition_issue` | Transition a Jira issue to a new status | `issue_key`, `transition_id` | `projects` (parsed from key) | Yes | Yes |
+| `jira_search_issues` | Search Jira issues within a project using JQL | `project` (key, required), optional `jql_filter`, optional `max_results` (default 50, capped at 100) | `projects` (from `project`) | No | No |
 | `confluence_get_page` | Fetch a Confluence page by ID | `page_id` (numeric page ID), `space` (key for allowlist) | `spaces` | No | No |
 | `confluence_create_page` | Create a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `title`, `body` (storage HTML), optional `parent_id` (numeric page ID) | `spaces` | Yes | Yes |
 | `confluence_update_page` | Update a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `page_id` (numeric ID), `title`, `version`, `body` (storage HTML) | `spaces` | Yes | Yes |
@@ -967,6 +968,20 @@ Binary files are reported as `[binary file, diff not shown]` instead of being
 forced into the text response. `max_lines` defaults to 2000; when the diff is
 truncated, the response includes `truncated: true` and the original
 `total_lines`.
+
+#### `jira_search_issues` JQL sandbox
+
+`jira_search_issues` never sends a raw `jql_filter` to Jira. Instead it builds a
+final JQL string that is always prefixed with `project = "<project>"` (and
+optionally `AND (<jql_filter>)`). The `project` argument is also checked against
+the agent's `projects` allowlist before any upstream call.
+
+To prevent `jql_filter` from trying to override the project scope, the filter is
+rejected (400) if it contains the tokens `project` or `projectKey` (case-
+insensitive). This is a lightweight keyword blacklist rather than a full JQL
+parser: it blocks the common bypass path without over-engineering the parser,
+but it may reject filters that merely mention the word "project" in a string
+value.
 
 Audit guarantee:
 

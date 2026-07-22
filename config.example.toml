@@ -115,6 +115,7 @@ enabled = false
 # tools: exact tool names this agent may call.
 # Implemented tools: jira_get_issue, jira_create_issue, jira_add_comment,
 #   jira_update_issue, jira_get_transitions, jira_transition_issue,
+#   jira_search_issues,
 #   confluence_get_page, confluence_create_page, confluence_update_page,
 #   bitbucket_get_repo, bitbucket_get_pull_request, bitbucket_get_pipeline_status,
 #   bitbucket_get_pull_request_diff,
@@ -126,6 +127,7 @@ enabled = false
 #   bitbucket_add_pull_request_comment
 # tools = ["jira_get_issue", "jira_create_issue", "jira_add_comment",
 #          "jira_update_issue", "jira_get_transitions", "jira_transition_issue",
+#          "jira_search_issues",
 #          "confluence_get_page", "confluence_create_page", "confluence_update_page",
 #          "bitbucket_get_repo", "bitbucket_get_pull_request",
 #          "bitbucket_get_pipeline_status",
