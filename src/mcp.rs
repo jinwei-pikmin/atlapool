@@ -509,8 +509,11 @@ async fn forward<C: UpstreamClient>(
 
     // Add a pagination hint for list-style upstream responses.
     if let Some(obj) = upstream_body.as_object_mut() {
-        if obj.get("values").is_some() || obj.get("results").is_some() {
-            let has_more = obj.get("next").is_some();
+        if obj.get("values").is_some()
+            || obj.get("results").is_some()
+            || obj.get("issues").is_some()
+        {
+            let has_more = obj.get("next").is_some() || obj.get("nextPageToken").is_some();
             obj.insert("has_more".to_string(), json!(has_more));
         }
     }
@@ -2328,7 +2331,7 @@ fn resolve_target(
                 project: Some(project.to_string()),
                 space: None,
                 method: Method::POST,
-                path: "/rest/api/3/search".into(),
+                path: "/rest/api/3/search/jql".into(),
                 body: RequestBody::json(json!({
                     "jql": jql,
                     "maxResults": max_results,
@@ -2907,8 +2910,7 @@ mod tests {
             s.headers.lock().unwrap().push(headers);
             let payload: Value = serde_json::from_slice(&body).unwrap_or_default();
             Json(json!({
-                "expand": "names,schema",
-                "startAt": 0,
+                "isLast": true,
                 "maxResults": payload["maxResults"],
                 "total": 1,
                 "issues": [
@@ -2954,7 +2956,7 @@ mod tests {
                 "/rest/api/3/issue/{key}/transitions",
                 get(get_transitions_handler).post(do_transition_handler),
             )
-            .route("/rest/api/3/search", post(search_handler))
+            .route("/rest/api/3/search/jql", post(search_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

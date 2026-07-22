@@ -53,9 +53,10 @@ project = "{project}"
 
 ### 呼叫 Jira REST API
 
-- `POST /rest/api/3/search`
+- `POST /rest/api/3/search/jql`（Atlassian 已棄用 `/rest/api/3/search`，增強型端點 `/search/jql` 使用 token 分頁）
 - Body: `{"jql": "...", "maxResults": N}`
 - 讀取工具，不需要 `enable_writes`。
+- 回應中的 `issues` 清單會加上 `has_more: true/false` 分頁提示；`nextPageToken` 存在時表示還有下一頁。
 
 ### allowlist
 

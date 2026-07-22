@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - `jira_search_issues`: reject `jql_filter` with unbalanced parentheses to prevent bypassing the forced `project = "..."` wrapper (e.g. `1=1) OR (1=1`)
+- `jira_search_issues`: migrate Jira endpoint from deprecated `/rest/api/3/search` to `/rest/api/3/search/jql`; add `has_more` hint from `nextPageToken`
 
 ### Added
 
