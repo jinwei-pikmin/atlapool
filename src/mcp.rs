@@ -5,9 +5,11 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use regex::Regex;
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 
 use crate::upstream::{RequestBody, UpstreamClient};
 use crate::{agents, AppState};
@@ -47,6 +49,8 @@ struct ToolTarget {
     /// `bitbucket_get_file_content`; when `ref` is omitted the default branch is
     /// resolved after authorization.
     resolve_ref: Option<ResolveRef>,
+    /// Optional `max_lines` for `bitbucket_get_pull_request_diff` truncation.
+    max_lines: Option<usize>,
 }
 
 #[derive(Default)]
@@ -400,6 +404,68 @@ async fn forward<C: UpstreamClient>(
     };
 
     let upstream_status = upstream_resp.status();
+
+    // Raw diff is plain text (possibly redirecting to a CDN). Read bytes so we
+    // can detect binary content and truncate/redact before wrapping.
+    if tool == "bitbucket_get_pull_request_diff" {
+        if !upstream_status.is_success() {
+            let message = format!("upstream returned {}", upstream_status);
+            if let Some(ref audit) = audit {
+                audit
+                    .record_result(
+                        &agent_id,
+                        &tool,
+                        &target_string,
+                        false,
+                        Some(upstream_status.as_u16()),
+                        Some(message.as_str()),
+                    )
+                    .await;
+            }
+            return Err((StatusCode::BAD_GATEWAY, message));
+        }
+
+        let bytes = match upstream_resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                let message = format!("failed to read upstream: {}", e);
+                if let Some(ref audit) = audit {
+                    audit
+                        .record_result(
+                            &agent_id,
+                            &tool,
+                            &target_string,
+                            false,
+                            Some(upstream_status.as_u16()),
+                            Some(message.as_str()),
+                        )
+                        .await;
+                }
+                return Err((StatusCode::BAD_GATEWAY, message));
+            }
+        };
+
+        let max_lines = target.max_lines.unwrap_or(2000);
+        let upstream_body = process_diff_body(bytes, max_lines);
+        if let Some(ref audit) = audit {
+            audit
+                .record_result(
+                    &agent_id,
+                    &tool,
+                    &target_string,
+                    true,
+                    Some(upstream_status.as_u16()),
+                    None,
+                )
+                .await;
+        }
+        let result = wrap_calltool_result(&upstream_body, false);
+        return Ok((
+            StatusCode::OK,
+            Json(json!({"jsonrpc":"2.0","id": request_id, "result": result})),
+        ));
+    }
+
     let upstream_text = match upstream_resp.text().await {
         Ok(text) => text,
         Err(e) => {
@@ -556,6 +622,58 @@ fn normalize_pipeline_status(mut upstream_body: Value) -> Value {
         }
     }
     upstream_body
+}
+
+fn secret_patterns() -> &'static [Regex; 3] {
+    static PATTERNS: OnceLock<[Regex; 3]> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
+            Regex::new(r"AKIA[0-9A-Z]{16}").unwrap(),
+            Regex::new(r"sk-[a-zA-Z0-9]{20,}").unwrap(),
+            Regex::new(r"Bearer [a-zA-Z0-9._-]{20,}").unwrap(),
+        ]
+    })
+}
+
+fn redact_secrets(text: &str) -> String {
+    let mut redacted = text.to_string();
+    for pattern in secret_patterns() {
+        redacted = pattern.replace_all(&redacted, "[REDACTED]").into_owned();
+    }
+    redacted
+}
+
+fn process_diff_body(bytes: Bytes, max_lines: usize) -> Value {
+    let text = match String::from_utf8(bytes.to_vec()) {
+        Ok(t) => t,
+        Err(_) => {
+            return json!({
+                "diff": "[binary file, diff not shown]",
+                "binary": true
+            });
+        }
+    };
+
+    let redacted = redact_secrets(&text);
+    let lines: Vec<&str> = redacted.lines().collect();
+    let total_lines = lines.len();
+    let (diff, truncated) = if total_lines > max_lines {
+        let mut truncated_lines: Vec<&str> = lines.into_iter().take(max_lines).collect();
+        truncated_lines.push("... (truncated; use a full git client for the complete diff)");
+        (truncated_lines.join("\n"), true)
+    } else {
+        (redacted, false)
+    };
+
+    let mut result = json!({
+        "diff": diff,
+        "total_lines": total_lines,
+    });
+    if truncated {
+        result["truncated"] = json!(true);
+        result["message"] = json!("diff exceeded max_lines and was truncated");
+    }
+    result
 }
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -835,6 +953,20 @@ fn all_tools() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "bitbucket_get_pull_request_diff",
+            description: "Get the raw diff of a Bitbucket pull request with secret redaction and optional line truncation.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "pull_request_id": { "type": "string", "description": "Numeric pull request ID" },
+                    "max_lines": { "type": "number", "description": "Maximum diff lines to return (default 2000)" }
+                },
+                "required": ["repo_slug", "pull_request_id"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
             name: "bitbucket_list_branches",
             description: "List branches in a Bitbucket repository.",
             input_schema: json!({
@@ -1081,6 +1213,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "jira_create_issue" => {
@@ -1100,6 +1233,7 @@ fn resolve_target(
                 body: RequestBody::json(args.clone()),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "jira_add_comment" => {
@@ -1121,6 +1255,7 @@ fn resolve_target(
                 body: RequestBody::json(json!({ "body": body })),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "confluence_get_page" => {
@@ -1150,6 +1285,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "confluence_create_page" => {
@@ -1212,6 +1348,7 @@ fn resolve_target(
                 body: RequestBody::json(payload),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "confluence_update_page" => {
@@ -1281,6 +1418,7 @@ fn resolve_target(
                 })),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_list_branches" => {
@@ -1301,6 +1439,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_list_directory" => {
@@ -1333,6 +1472,7 @@ fn resolve_target(
                     body: RequestBody::None,
                     update: None,
                     resolve_ref: None,
+                    max_lines: None,
                 })
             } else {
                 Ok(ToolTarget {
@@ -1349,6 +1489,7 @@ fn resolve_target(
                         sub_path,
                         trailing_slash: true,
                     }),
+                    max_lines: None,
                 })
             }
         }
@@ -1381,6 +1522,7 @@ fn resolve_target(
                     body: RequestBody::None,
                     update: None,
                     resolve_ref: None,
+                    max_lines: None,
                 })
             } else {
                 Ok(ToolTarget {
@@ -1397,6 +1539,7 @@ fn resolve_target(
                         sub_path,
                         trailing_slash: false,
                     }),
+                    max_lines: None,
                 })
             }
         }
@@ -1418,6 +1561,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_get_pull_request" => {
@@ -1447,6 +1591,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_list_pull_requests" => {
@@ -1477,6 +1622,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_list_pull_request_changes" => {
@@ -1506,6 +1652,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_get_pipeline_status" => {
@@ -1532,6 +1679,42 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
+            })
+        }
+        "bitbucket_get_pull_request_diff" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let pull_request_id = args
+                .get("pull_request_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing pull_request_id")?;
+            if pull_request_id.is_empty() || !pull_request_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err("pull_request_id must be a non-empty numeric id".into());
+            }
+            let max_lines = args
+                .get("max_lines")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(2000);
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::GET,
+                path: format!(
+                    "/repositories/{workspace}/{repo_slug}/pullrequests/{pull_request_id}/diff"
+                ),
+                body: RequestBody::None,
+                update: None,
+                resolve_ref: None,
+                max_lines: Some(max_lines),
             })
         }
         "bitbucket_create_branch" => {
@@ -1565,6 +1748,7 @@ fn resolve_target(
                 })),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_create_commit" => {
@@ -1625,6 +1809,7 @@ fn resolve_target(
                 body: RequestBody::form(form_fields),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_create_pull_request" => {
@@ -1670,6 +1855,7 @@ fn resolve_target(
                 body: RequestBody::json(body),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_merge_pull_request" => {
@@ -1707,6 +1893,7 @@ fn resolve_target(
                 body: RequestBody::json(body),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_decline_pull_request" => {
@@ -1736,6 +1923,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_delete_branch" => {
@@ -1764,6 +1952,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_add_pull_request_comment" => {
@@ -1800,6 +1989,7 @@ fn resolve_target(
                 body: RequestBody::json(body),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_create_repo" => {
@@ -1824,6 +2014,7 @@ fn resolve_target(
                 body: RequestBody::json(json!({ "is_private": is_private })),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "jira_update_issue" => {
@@ -1867,6 +2058,7 @@ fn resolve_target(
                     description_append,
                 }),
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "jira_get_transitions" => {
@@ -1887,6 +2079,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "jira_transition_issue" => {
@@ -1914,6 +2107,7 @@ fn resolve_target(
                 body: RequestBody::json(json!({ "transition": { "id": transition_id } })),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         _ => Err("unsupported tool".into()),
@@ -2225,6 +2419,7 @@ mod tests {
                     "bitbucket_list_pull_requests".into(),
                     "bitbucket_list_pull_request_changes".into(),
                     "bitbucket_get_pipeline_status".into(),
+                    "bitbucket_get_pull_request_diff".into(),
                     "bitbucket_list_branches".into(),
                     "bitbucket_list_directory".into(),
                     "bitbucket_get_file_content".into(),
@@ -4332,6 +4527,39 @@ mod tests {
             }))
         };
 
+        let diff_handler = |State(s): State<MockState>,
+                            Path((_workspace, _repo, pr_id)): Path<(String, String, String)>,
+                            headers: HeaderMap| async move {
+            s.headers.lock().unwrap().push(headers);
+            if pr_id == "43" {
+                // Return invalid UTF-8 bytes to simulate a binary diff.
+                return (StatusCode::OK, vec![0xffu8, 0xfe, 0xfd, 0xfc]).into_response();
+            }
+
+            if pr_id == "44" {
+                let body = (0..2500)
+                    .map(|i| format!("+line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return (StatusCode::OK, body).into_response();
+            }
+
+            let body = format!(
+                "diff --git a/src/main.rs b/src/main.rs\n\
+index abc..def 100644\n\
+--- a/src/main.rs\n\
++++ b/src/main.rs\n\
+@@ -1,3 +1,6 @@\n\
++aws = \"AKIA0123456789ABCDEF\"\n\
++openai = \"sk-abcdefghijklmnopqrstuvwxyz\"\n\
++token = \"Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature\"\n\
+ fn main() {{\n\
+     println!(\"hello\");\n\
+ }}\n"
+            );
+            (StatusCode::OK, body).into_response()
+        };
+
         let pipeline_status_handler = |State(s): State<MockState>,
                                        Path((workspace, repo)): Path<(String, String)>,
                                        Query(params): Query<
@@ -4618,6 +4846,10 @@ mod tests {
             .route(
                 "/repositories/{workspace}/{repo}/pullrequests/{pr_id}/diffstat",
                 get(diffstat_handler),
+            )
+            .route(
+                "/repositories/{workspace}/{repo}/pullrequests/{pr_id}/diff",
+                get(diff_handler),
             )
             .route(
                 "/repositories/{workspace}/{repo}/pipelines/",
@@ -5115,6 +5347,201 @@ mod tests {
             .oneshot(build_request(
                 "bitbucket_get_pipeline_status",
                 json!({"repo_slug": "my-repo", "branch": "main"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not permitted by agent policy"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_diff_returns_redacted_raw_diff() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request_diff",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        let diff = json["result"]["structuredContent"]["diff"]
+            .as_str()
+            .unwrap();
+        assert!(diff.contains("diff --git"));
+        assert!(diff.contains("[REDACTED]"));
+        assert!(!diff.contains("AKIA0123456789ABCDEF"));
+        assert!(!diff.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+        assert!(!diff.contains("Bearer eyJhbGciOiJIUzI1NiJ9"));
+        assert_eq!(json["result"]["structuredContent"]["total_lines"], 11);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_diff_truncates_with_max_lines() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request_diff",
+                json!({"repo_slug": "my-repo", "pull_request_id": "44", "max_lines": 100}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(json["result"]["structuredContent"]["total_lines"], 2500);
+        assert_eq!(json["result"]["structuredContent"]["truncated"], true);
+        let diff = json["result"]["structuredContent"]["diff"]
+            .as_str()
+            .unwrap();
+        let diff_lines: Vec<&str> = diff.lines().collect();
+        // 100 content lines + the truncation marker line.
+        assert_eq!(diff_lines.len(), 101);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_diff_binary_marked() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request_diff",
+                json!({"repo_slug": "my-repo", "pull_request_id": "43"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(
+            json["result"]["structuredContent"]["diff"],
+            "[binary file, diff not shown]"
+        );
+        assert_eq!(json["result"]["structuredContent"]["binary"], true);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_diff_invalid_pr_id_returns_400() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request_diff",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42abc"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_diff_allowlist_blocks_repo() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["allowed-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request_diff",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
                 Some("agent-key"),
             ))
             .await
