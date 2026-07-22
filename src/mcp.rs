@@ -433,7 +433,33 @@ async fn forward<C: UpstreamClient>(
         }
     }
 
-    let (status, envelope) = if upstream_status.is_success() {
+    // For pipeline status, a 404 or empty result means pipelines are not configured
+    // or have never run for the branch; normalize to a non-error status instead of
+    // returning an error envelope.
+    let (treat_as_success, upstream_body) = if tool == "bitbucket_get_pipeline_status" {
+        let is_missing = upstream_status == StatusCode::NOT_FOUND
+            || upstream_body
+                .get("values")
+                .and_then(|v| v.as_array())
+                .map(|v| v.is_empty())
+                .unwrap_or(true);
+        let success = upstream_status.is_success() || upstream_status == StatusCode::NOT_FOUND;
+        let body = if is_missing && success {
+            normalize_pipeline_status(json!({
+                "values": [],
+                "message": "Pipelines are not configured or have not run for the requested branch"
+            }))
+        } else if upstream_status.is_success() {
+            normalize_pipeline_status(upstream_body)
+        } else {
+            upstream_body
+        };
+        (success, body)
+    } else {
+        (upstream_status.is_success(), upstream_body)
+    };
+
+    let (status, envelope) = if treat_as_success {
         if let Some(ref audit) = audit {
             audit
                 .record_result(
@@ -473,6 +499,63 @@ async fn forward<C: UpstreamClient>(
     };
 
     Ok((status, Json(envelope)))
+}
+
+/// Normalize a Bitbucket Pipelines response into a single `normalized_status`.
+///
+/// Bitbucket uses two fields: `state` (PENDING/IN_PROGRESS/RUNNING/PAUSED/COMPLETED)
+/// and `result` (SUCCESSFUL/FAILED/ERROR/STOPPED/EXPIRED) when completed.
+/// This function maps those to `passed`/`failed`/`running`/`unknown`.
+fn normalize_pipeline_status(mut upstream_body: Value) -> Value {
+    let values = upstream_body
+        .get("values")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let (normalized, explanation, pipeline) = if let Some(first) = values.first() {
+        let state = first
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let result = first
+            .get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+
+        let normalized = match state.as_str() {
+            "PENDING" | "IN_PROGRESS" | "RUNNING" | "PAUSED" => "running",
+            "COMPLETED" => match result.as_str() {
+                "SUCCESSFUL" => "passed",
+                "FAILED" | "ERROR" | "STOPPED" | "EXPIRED" => "failed",
+                _ => "unknown",
+            },
+            _ => "unknown",
+        };
+
+        let explanation = format!("pipeline state is {state}, result is {result}");
+        (normalized, explanation, first.clone())
+    } else {
+        let explanation = upstream_body
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("no pipeline runs found for the requested branch")
+            .to_string();
+        ("unknown", explanation, Value::Null)
+    };
+
+    if let Some(obj) = upstream_body.as_object_mut() {
+        obj.insert("normalized_status".to_string(), json!(normalized));
+        obj.insert("status_message".to_string(), json!(explanation));
+        if pipeline.is_null() {
+            obj.insert("pipeline".to_string(), json!(null));
+        } else {
+            obj.insert("pipeline".to_string(), pipeline);
+        }
+    }
+    upstream_body
 }
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -735,6 +818,19 @@ fn all_tools() -> Vec<Tool> {
                     "pull_request_id": { "type": "string", "description": "Numeric pull request ID" }
                 },
                 "required": ["repo_slug", "pull_request_id"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "bitbucket_get_pipeline_status",
+            description: "Get the latest Bitbucket Pipelines status for a branch.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "branch": { "type": "string", "description": "Branch name" }
+                },
+                "required": ["repo_slug", "branch"],
                 "additionalProperties": false
             }),
         },
@@ -1407,6 +1503,32 @@ fn resolve_target(
                 path: format!(
                     "/repositories/{workspace}/{repo_slug}/pullrequests/{pull_request_id}/diffstat"
                 ),
+                body: RequestBody::None,
+                update: None,
+                resolve_ref: None,
+            })
+        }
+        "bitbucket_get_pipeline_status" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let branch = args
+                .get("branch")
+                .and_then(|v| v.as_str())
+                .ok_or("missing branch")?;
+            valid_branch_name(branch)?;
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            let encoded_branch = encode_path_segment(branch);
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::GET,
+                path: format!("/repositories/{workspace}/{repo_slug}/pipelines/?sort=-created_on&target.branch={encoded_branch}&pagelen=1"),
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
@@ -2102,6 +2224,7 @@ mod tests {
                     "bitbucket_get_pull_request".into(),
                     "bitbucket_list_pull_requests".into(),
                     "bitbucket_list_pull_request_changes".into(),
+                    "bitbucket_get_pipeline_status".into(),
                     "bitbucket_list_branches".into(),
                     "bitbucket_list_directory".into(),
                     "bitbucket_get_file_content".into(),
@@ -4209,6 +4332,81 @@ mod tests {
             }))
         };
 
+        let pipeline_status_handler = |State(s): State<MockState>,
+                                       Path((workspace, repo)): Path<(String, String)>,
+                                       Query(params): Query<
+            std::collections::HashMap<String, String>,
+        >,
+                                       headers: HeaderMap| async move {
+            s.headers.lock().unwrap().push(headers);
+            let branch = params
+                .get("target.branch")
+                .map(|s| s.as_str())
+                .unwrap_or("main");
+
+            // Simulate "no pipelines" for the literal sentinel branch.
+            if branch == "no-pipelines" {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(
+                        json!({"type": "error", "error": { "message": "There are no pipelines configured for this repository." } }),
+                    ),
+                );
+            }
+
+            let response = if branch == "feature/in-progress" {
+                json!({
+                    "values": [
+                        {
+                            "uuid": "{pipeline-uuid}",
+                            "state": "IN_PROGRESS",
+                            "result": null,
+                            "created_on": "2026-07-22T00:00:00Z",
+                            "target": { "type": "pipeline_target_branch", "ref_name": branch },
+                            "repository": { "full_name": format!("{workspace}/{repo}") }
+                        }
+                    ],
+                    "size": 1,
+                    "page": 1,
+                    "pagelen": 1
+                })
+            } else if branch == "feature/failed" {
+                json!({
+                    "values": [
+                        {
+                            "uuid": "{pipeline-uuid}",
+                            "state": "COMPLETED",
+                            "result": "FAILED",
+                            "created_on": "2026-07-22T00:00:00Z",
+                            "target": { "type": "pipeline_target_branch", "ref_name": branch },
+                            "repository": { "full_name": format!("{workspace}/{repo}") }
+                        }
+                    ],
+                    "size": 1,
+                    "page": 1,
+                    "pagelen": 1
+                })
+            } else {
+                json!({
+                    "values": [
+                        {
+                            "uuid": "{pipeline-uuid}",
+                            "state": "COMPLETED",
+                            "result": "SUCCESSFUL",
+                            "created_on": "2026-07-22T00:00:00Z",
+                            "target": { "type": "pipeline_target_branch", "ref_name": branch },
+                            "repository": { "full_name": format!("{workspace}/{repo}") }
+                        }
+                    ],
+                    "size": 1,
+                    "page": 1,
+                    "pagelen": 1
+                })
+            };
+
+            (StatusCode::OK, Json(response))
+        };
+
         let create_repo_handler = |State(s): State<MockState>,
                                    Path((workspace, repo)): Path<(String, String)>,
                                    headers: HeaderMap,
@@ -4420,6 +4618,10 @@ mod tests {
             .route(
                 "/repositories/{workspace}/{repo}/pullrequests/{pr_id}/diffstat",
                 get(diffstat_handler),
+            )
+            .route(
+                "/repositories/{workspace}/{repo}/pipelines/",
+                get(pipeline_status_handler),
             )
             .route(
                 "/repositories/{workspace}/{repo}/refs/branches",
@@ -4673,6 +4875,246 @@ mod tests {
             .oneshot(build_request(
                 "bitbucket_list_pull_request_changes",
                 json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not permitted by agent policy"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pipeline_status_passed() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pipeline_status",
+                json!({"repo_slug": "my-repo", "branch": "main"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(
+            json["result"]["structuredContent"]["normalized_status"],
+            "passed"
+        );
+        assert_eq!(
+            json["result"]["structuredContent"]["pipeline"]["state"],
+            "COMPLETED"
+        );
+        assert_eq!(
+            json["result"]["structuredContent"]["pipeline"]["result"],
+            "SUCCESSFUL"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pipeline_status_running() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pipeline_status",
+                json!({"repo_slug": "my-repo", "branch": "feature/in-progress"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(
+            json["result"]["structuredContent"]["normalized_status"],
+            "running"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pipeline_status_failed() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pipeline_status",
+                json!({"repo_slug": "my-repo", "branch": "feature/failed"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(
+            json["result"]["structuredContent"]["normalized_status"],
+            "failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pipeline_status_no_pipelines_returns_unknown_not_error() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pipeline_status",
+                json!({"repo_slug": "my-repo", "branch": "no-pipelines"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(
+            json["result"]["structuredContent"]["normalized_status"],
+            "unknown"
+        );
+        assert!(json["result"]["structuredContent"]["status_message"]
+            .as_str()
+            .unwrap()
+            .contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pipeline_status_invalid_branch_returns_400() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pipeline_status",
+                json!({"repo_slug": "my-repo", "branch": ".."}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pipeline_status_allowlist_blocks_repo() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["allowed-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pipeline_status",
+                json!({"repo_slug": "my-repo", "branch": "main"}),
                 Some("agent-key"),
             ))
             .await

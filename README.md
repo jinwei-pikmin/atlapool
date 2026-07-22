@@ -368,6 +368,7 @@ Example `tools/call` envelope:
 | `confluence_update_page` | Update a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `page_id` (numeric ID), `title`, `version`, `body` (storage HTML) | `spaces` | Yes | Yes |
 | `bitbucket_get_repo` | Fetch a Bitbucket repository | `repo_slug` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_get_pull_request` | Fetch a Bitbucket pull request | `repo_slug`, `pull_request_id` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
+| `bitbucket_get_pipeline_status` | Get latest Bitbucket Pipelines status for a branch | `repo_slug`, `branch` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_list_pull_requests` | List pull requests in a repository | `repo_slug`, optional `state` (`OPEN`, `MERGED`, `DECLINED`, `SUPERSEDED`; default `OPEN`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_list_pull_request_changes` | List changed files and line statistics for a pull request (diffstat) | `repo_slug`, `pull_request_id` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_list_branches` | List branches in a Bitbucket repository | `repo_slug` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
@@ -859,6 +860,7 @@ Choose one of the following authentication methods:
 
    - `repository:read` — for `bitbucket_get_repo`, `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`
    - `pullrequest:read` — for `bitbucket_get_pull_request`, `bitbucket_list_pull_requests`, `bitbucket_list_pull_request_changes`
+   - `pipeline` — for `bitbucket_get_pipeline_status` (read-only; `pipeline:write` is not required)
    - `repository:write` — for `bitbucket_create_branch`, `bitbucket_create_commit`
    - `repository:admin` — for `bitbucket_create_repo` (Bitbucket's API requires admin scope to create repositories; this is different from `repository:write`)
    - `pullrequest:write` — for `bitbucket_create_pull_request`
@@ -894,6 +896,7 @@ repository:read
 repository:write
 pullrequest:read
 pullrequest:write
+pipeline
 ```
 
 Scope-to-tool mapping:
@@ -902,6 +905,7 @@ Scope-to-tool mapping:
 - `repository:read` — `bitbucket_get_repo`, `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`
 - `repository:write` — `bitbucket_create_branch`, `bitbucket_create_commit`, `bitbucket_delete_branch`
 - `pullrequest:read` — `bitbucket_get_pull_request`, `bitbucket_list_pull_requests`, `bitbucket_list_pull_request_changes`
+- `pipeline` — `bitbucket_get_pipeline_status` (read-only; `pipeline:write` is not required)
 - `pullrequest:write` — `bitbucket_create_pull_request`, `bitbucket_merge_pull_request`, `bitbucket_decline_pull_request`, `bitbucket_add_pull_request_comment`
 
 ### Agent allowlists
@@ -918,7 +922,7 @@ Scope-to-tool mapping:
 ### Read vs. write and audit
 
 Read tools (`jira_get_issue`, `confluence_get_page`, `bitbucket_get_repo`,
-`bitbucket_get_pull_request`, `bitbucket_list_pull_requests`, `bitbucket_list_pull_request_changes`,
+`bitbucket_get_pull_request`, `bitbucket_get_pipeline_status`, `bitbucket_list_pull_requests`, `bitbucket_list_pull_request_changes`,
 `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`) pass through the allowlist and do not touch the
 audit log.
 
@@ -929,6 +933,23 @@ Write tools (`jira_create_issue`, `jira_add_comment`, `confluence_create_page`,
 `bitbucket_delete_branch`, `bitbucket_add_pull_request_comment`) require a configured
 `audit.path` and `enable_writes` to be `true` for the agent (per-agent value if
 set, otherwise `[mcp] enable_writes`).
+
+#### `bitbucket_get_pipeline_status` status normalization
+
+Bitbucket Pipelines reports `state` and `result` separately. atlapool normalizes
+the latest pipeline into a single `normalized_status` field for easier
+consumption:
+
+| `state` | `result` | `normalized_status` | Meaning |
+|---|---|---|---|
+| `PENDING`, `IN_PROGRESS`, `RUNNING`, `PAUSED` | any | `running` | Pipeline has not finished |
+| `COMPLETED` | `SUCCESSFUL` | `passed` | Pipeline finished successfully |
+| `COMPLETED` | `FAILED`, `ERROR`, `STOPPED`, `EXPIRED` | `failed` | Pipeline finished unsuccessfully |
+| other | other | `unknown` | Unexpected or missing state |
+
+If no pipelines are configured for the repository or no runs exist for the
+requested branch, the tool returns `normalized_status: "unknown"` with an
+informative message and `isError: false`.
 
 Audit guarantee:
 
