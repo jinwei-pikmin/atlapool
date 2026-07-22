@@ -364,7 +364,8 @@ Example `tools/call` envelope:
 | `jira_get_transitions` | List available transitions for a Jira issue | `issue_key` | `projects` (parsed from key) | No | No |
 | `jira_transition_issue` | Transition a Jira issue to a new status | `issue_key`, `transition_id` | `projects` (parsed from key) | Yes | Yes |
 | `jira_search_issues` | Search Jira issues within a project using JQL | `project` (key, required), optional `jql_filter`, optional `max_results` (default 50, capped at 100) | `projects` (from `project`) | No | No |
-| `confluence_get_page` | Fetch a Confluence page by ID | `page_id` (numeric page ID), `space` (key for allowlist) | `spaces` | No | No |
+| `jira_list_comments` | List comments on a Jira issue | `issue_key` (e.g. `PROJ-123`) | `projects` (parsed from key) | No | No |
+| `confluence_get_page` | Fetch a Confluence page by ID or by space + title | `space` (key for allowlist) and either `page_id` or `space_id` + `title` | `spaces` | No | No |
 | `confluence_create_page` | Create a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `title`, `body` (storage HTML), optional `parent_id` (numeric page ID) | `spaces` | Yes | Yes |
 | `confluence_update_page` | Update a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `page_id` (numeric ID), `title`, `version`, `body` (storage HTML) | `spaces` | Yes | Yes |
 | `confluence_list_pages` | List pages in a Confluence space | `space` (key for allowlist), `space_id` (numeric ID) | `spaces` | No | No |

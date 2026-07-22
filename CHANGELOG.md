@@ -8,7 +8,9 @@ All notable changes to this project will be documented in this file.
 
 - Jira tools:
   - Read: `jira_search_issues` with forced `project = "..."` JQL prefix, `project`/`projectKey` keyword blacklist, and `max_results` clamping
+  - Read: `jira_list_comments`
 - Confluence tools:
+  - Read: `confluence_get_page` now supports lookup by `space` + `title` in addition to `page_id`
   - Read: `confluence_list_pages` with `has_more` pagination hint
   - Write: `confluence_delete_page` with write-gate and fail-closed audit
 - Bitbucket tools:
