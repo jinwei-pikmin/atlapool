@@ -5,9 +5,11 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use regex::Regex;
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 
 use crate::upstream::{RequestBody, UpstreamClient};
 use crate::{agents, AppState};
@@ -47,6 +49,8 @@ struct ToolTarget {
     /// `bitbucket_get_file_content`; when `ref` is omitted the default branch is
     /// resolved after authorization.
     resolve_ref: Option<ResolveRef>,
+    /// Optional `max_lines` for `bitbucket_get_pull_request_diff` truncation.
+    max_lines: Option<usize>,
 }
 
 #[derive(Default)]
@@ -258,6 +262,22 @@ pub async fn mcp_handler(
                 "confluence upstream not configured",
             );
         };
+
+        // confluence_get_page by title needs a title-to-page-id lookup before
+        // fetching the full page body.
+        if params.name == "confluence_get_page" && target.path.starts_with("/wiki/api/v2/spaces/") {
+            match resolve_confluence_page_by_title(confluence, &target.path).await {
+                Ok(ConfluenceTitleResult::Found(page_id)) => {
+                    target.path = format!("/wiki/api/v2/pages/{page_id}?body-format=view");
+                }
+                Ok(ConfluenceTitleResult::NotFound(message))
+                | Ok(ConfluenceTitleResult::Multiple(message)) => {
+                    return mcp_policy_error(request.id, &message);
+                }
+                Err((status, message)) => return mcp_error(request.id, status, &message),
+            }
+        }
+
         forward(
             confluence,
             audit,
@@ -400,6 +420,68 @@ async fn forward<C: UpstreamClient>(
     };
 
     let upstream_status = upstream_resp.status();
+
+    // Raw diff is plain text (possibly redirecting to a CDN). Read bytes so we
+    // can detect binary content and truncate/redact before wrapping.
+    if tool == "bitbucket_get_pull_request_diff" {
+        if !upstream_status.is_success() {
+            let message = format!("upstream returned {}", upstream_status);
+            if let Some(ref audit) = audit {
+                audit
+                    .record_result(
+                        &agent_id,
+                        &tool,
+                        &target_string,
+                        false,
+                        Some(upstream_status.as_u16()),
+                        Some(message.as_str()),
+                    )
+                    .await;
+            }
+            return Err((StatusCode::BAD_GATEWAY, message));
+        }
+
+        let bytes = match upstream_resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                let message = format!("failed to read upstream: {}", e);
+                if let Some(ref audit) = audit {
+                    audit
+                        .record_result(
+                            &agent_id,
+                            &tool,
+                            &target_string,
+                            false,
+                            Some(upstream_status.as_u16()),
+                            Some(message.as_str()),
+                        )
+                        .await;
+                }
+                return Err((StatusCode::BAD_GATEWAY, message));
+            }
+        };
+
+        let max_lines = target.max_lines.unwrap_or(2000);
+        let upstream_body = process_diff_body(bytes, max_lines);
+        if let Some(ref audit) = audit {
+            audit
+                .record_result(
+                    &agent_id,
+                    &tool,
+                    &target_string,
+                    true,
+                    Some(upstream_status.as_u16()),
+                    None,
+                )
+                .await;
+        }
+        let result = wrap_calltool_result(&upstream_body, false);
+        return Ok((
+            StatusCode::OK,
+            Json(json!({"jsonrpc":"2.0","id": request_id, "result": result})),
+        ));
+    }
+
     let upstream_text = match upstream_resp.text().await {
         Ok(text) => text,
         Err(e) => {
@@ -427,8 +509,11 @@ async fn forward<C: UpstreamClient>(
 
     // Add a pagination hint for list-style upstream responses.
     if let Some(obj) = upstream_body.as_object_mut() {
-        if obj.get("values").is_some() {
-            let has_more = obj.get("next").is_some();
+        if obj.get("values").is_some()
+            || obj.get("results").is_some()
+            || obj.get("issues").is_some()
+        {
+            let has_more = obj.get("next").is_some() || obj.get("nextPageToken").is_some();
             obj.insert("has_more".to_string(), json!(has_more));
         }
     }
@@ -556,6 +641,63 @@ fn normalize_pipeline_status(mut upstream_body: Value) -> Value {
         }
     }
     upstream_body
+}
+
+fn secret_patterns() -> &'static [Regex; 3] {
+    static PATTERNS: OnceLock<[Regex; 3]> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
+            Regex::new(r"AKIA[0-9A-Z]{16}").unwrap(),
+            Regex::new(r"sk-[a-zA-Z0-9]{20,}").unwrap(),
+            Regex::new(r"Bearer [a-zA-Z0-9._-]{20,}").unwrap(),
+        ]
+    })
+}
+
+fn redact_secrets(text: &str) -> String {
+    let mut redacted = text.to_string();
+    for pattern in secret_patterns() {
+        redacted = pattern.replace_all(&redacted, "[REDACTED]").into_owned();
+    }
+    redacted
+}
+
+fn process_diff_body(bytes: Bytes, max_lines: usize) -> Value {
+    let text = match String::from_utf8(bytes.to_vec()) {
+        Ok(t) => t,
+        Err(_) => {
+            return json!({
+                "diff": "[binary file, diff not shown]",
+                "binary": true
+            });
+        }
+    };
+
+    let redacted = redact_secrets(&text);
+    let lines: Vec<&str> = redacted.lines().collect();
+    let total_lines = lines.len();
+    let (diff, truncated) = if total_lines > max_lines {
+        let mut truncated_lines: Vec<&str> = lines.into_iter().take(max_lines).collect();
+        truncated_lines.push("... (truncated; use a full git client for the complete diff)");
+        (truncated_lines.join("\n"), true)
+    } else {
+        (redacted, false)
+    };
+
+    let mut result = json!({
+        "diff": diff,
+        "total_lines": total_lines,
+    });
+    if truncated {
+        result["truncated"] = json!(true);
+        result["message"] = json!("diff exceeded max_lines and was truncated");
+    }
+    result
+}
+
+fn jql_project_override_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)\b(project|projectkey)\b").unwrap())
 }
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -725,15 +867,44 @@ fn all_tools() -> Vec<Tool> {
             }),
         },
         Tool {
-            name: "confluence_get_page",
-            description: "Fetch a Confluence page by ID.",
+            name: "jira_search_issues",
+            description: "Search Jira issues within a project using JQL.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "page_id": { "type": "string", "description": "Numeric page ID" },
-                    "space": { "type": "string", "description": "Space key for allowlist" }
+                    "project": { "type": "string", "description": "Jira project key (required, must be in allowlist)" },
+                    "jql_filter": { "type": "string", "description": "Optional additional JQL condition; cannot contain project/projectKey tokens" },
+                    "max_results": { "type": "number", "description": "Maximum results (default 50, capped at 100)" }
                 },
-                "required": ["page_id", "space"],
+                "required": ["project"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "jira_list_comments",
+            description: "List comments on a Jira issue.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "issue_key": { "type": "string", "description": "Issue key, e.g. PROJ-123" }
+                },
+                "required": ["issue_key"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "confluence_get_page",
+            description: "Fetch a Confluence page by ID or by space + title.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "space": { "type": "string", "description": "Space key for allowlist" },
+                    "page_id": { "type": "string", "description": "Numeric page ID (use either page_id or title)" },
+                    "space_id": { "type": "string", "description": "Numeric space ID (required with title)" },
+                    "title": { "type": "string", "description": "Page title to look up in the space (use with space_id)" }
+                },
+                "required": ["space"],
+                "minProperties": 2,
                 "additionalProperties": false
             }),
         },
@@ -767,6 +938,32 @@ fn all_tools() -> Vec<Tool> {
                     "body": { "type": "string", "description": "Storage-format HTML" }
                 },
                 "required": ["space", "space_id", "page_id", "title", "version", "body"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "confluence_list_pages",
+            description: "List pages in a Confluence space.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "space": { "type": "string", "description": "Space key for allowlist" },
+                    "space_id": { "type": "string", "description": "Numeric space ID" }
+                },
+                "required": ["space", "space_id"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "confluence_delete_page",
+            description: "Delete a Confluence page.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "space": { "type": "string", "description": "Space key for allowlist" },
+                    "page_id": { "type": "string", "description": "Numeric page ID" }
+                },
+                "required": ["space", "page_id"],
                 "additionalProperties": false
             }),
         },
@@ -831,6 +1028,20 @@ fn all_tools() -> Vec<Tool> {
                     "branch": { "type": "string", "description": "Branch name" }
                 },
                 "required": ["repo_slug", "branch"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "bitbucket_get_pull_request_diff",
+            description: "Get the raw diff of a Bitbucket pull request with secret redaction and optional line truncation.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "pull_request_id": { "type": "string", "description": "Numeric pull request ID" },
+                    "max_lines": { "type": "number", "description": "Maximum diff lines to return (default 2000)" }
+                },
+                "required": ["repo_slug", "pull_request_id"],
                 "additionalProperties": false
             }),
         },
@@ -1081,6 +1292,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "jira_create_issue" => {
@@ -1100,6 +1312,7 @@ fn resolve_target(
                 body: RequestBody::json(args.clone()),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "jira_add_comment" => {
@@ -1121,6 +1334,7 @@ fn resolve_target(
                 body: RequestBody::json(json!({ "body": body })),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "confluence_get_page" => {
@@ -1133,24 +1347,51 @@ fn resolve_target(
             if space.is_empty() {
                 return Err("space must not be empty".into());
             }
-            let page_id = args
-                .get("page_id")
-                .and_then(|v| v.as_str())
-                .ok_or("missing page_id")?;
-            if page_id.is_empty() || !page_id.chars().all(|c| c.is_ascii_digit()) {
-                return Err("page_id must be a non-empty numeric id".into());
+
+            let page_id = args.get("page_id").and_then(|v| v.as_str());
+            let title = args.get("title").and_then(|v| v.as_str());
+            let space_id = args.get("space_id").and_then(|v| v.as_str());
+
+            if let Some(page_id) = page_id {
+                if page_id.is_empty() || !page_id.chars().all(|c| c.is_ascii_digit()) {
+                    return Err("page_id must be a non-empty numeric id".into());
+                }
+                Ok(ToolTarget {
+                    workspace: None,
+                    repo: None,
+                    project: None,
+                    space: Some(space),
+                    method: Method::GET,
+                    path: format!("/wiki/api/v2/pages/{page_id}?body-format=view"),
+                    body: RequestBody::None,
+                    update: None,
+                    resolve_ref: None,
+                    max_lines: None,
+                })
+            } else if let Some(title) = title {
+                let space_id = space_id.ok_or("missing space_id for title lookup")?;
+                if space_id.is_empty() || !space_id.chars().all(|c| c.is_ascii_digit()) {
+                    return Err("space_id must be a non-empty numeric id".into());
+                }
+                if title.is_empty() {
+                    return Err("title must not be empty".into());
+                }
+                let encoded_title = urlencoding::encode(title);
+                Ok(ToolTarget {
+                    workspace: None,
+                    repo: None,
+                    project: None,
+                    space: Some(space),
+                    method: Method::GET,
+                    path: format!("/wiki/api/v2/spaces/{space_id}/pages?title={encoded_title}"),
+                    body: RequestBody::None,
+                    update: None,
+                    resolve_ref: None,
+                    max_lines: None,
+                })
+            } else {
+                Err("either page_id or title (with space_id) must be provided".into())
             }
-            Ok(ToolTarget {
-                workspace: None,
-                repo: None,
-                project: None,
-                space: Some(space),
-                method: Method::GET,
-                path: format!("/wiki/api/v2/pages/{page_id}?body-format=view"),
-                body: RequestBody::None,
-                update: None,
-                resolve_ref: None,
-            })
         }
         "confluence_create_page" => {
             let args = args.ok_or("missing arguments")?;
@@ -1212,6 +1453,7 @@ fn resolve_target(
                 body: RequestBody::json(payload),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "confluence_update_page" => {
@@ -1281,6 +1523,67 @@ fn resolve_target(
                 })),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
+            })
+        }
+        "confluence_list_pages" => {
+            let args = args.ok_or("missing arguments")?;
+            let space = args
+                .get("space")
+                .and_then(|v| v.as_str())
+                .ok_or("missing space")?
+                .to_string();
+            if space.is_empty() {
+                return Err("space must not be empty".into());
+            }
+            let space_id = args
+                .get("space_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing space_id")?;
+            if space_id.is_empty() || !space_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err("space_id must be a non-empty numeric id".into());
+            }
+            Ok(ToolTarget {
+                workspace: None,
+                repo: None,
+                project: None,
+                space: Some(space),
+                method: Method::GET,
+                path: format!("/wiki/api/v2/spaces/{space_id}/pages"),
+                body: RequestBody::None,
+                update: None,
+                resolve_ref: None,
+                max_lines: None,
+            })
+        }
+        "confluence_delete_page" => {
+            let args = args.ok_or("missing arguments")?;
+            let space = args
+                .get("space")
+                .and_then(|v| v.as_str())
+                .ok_or("missing space")?
+                .to_string();
+            if space.is_empty() {
+                return Err("space must not be empty".into());
+            }
+            let page_id = args
+                .get("page_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing page_id")?;
+            if page_id.is_empty() || !page_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err("page_id must be a non-empty numeric id".into());
+            }
+            Ok(ToolTarget {
+                workspace: None,
+                repo: None,
+                project: None,
+                space: Some(space),
+                method: Method::DELETE,
+                path: format!("/wiki/api/v2/pages/{page_id}"),
+                body: RequestBody::None,
+                update: None,
+                resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_list_branches" => {
@@ -1301,6 +1604,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_list_directory" => {
@@ -1333,6 +1637,7 @@ fn resolve_target(
                     body: RequestBody::None,
                     update: None,
                     resolve_ref: None,
+                    max_lines: None,
                 })
             } else {
                 Ok(ToolTarget {
@@ -1349,6 +1654,7 @@ fn resolve_target(
                         sub_path,
                         trailing_slash: true,
                     }),
+                    max_lines: None,
                 })
             }
         }
@@ -1381,6 +1687,7 @@ fn resolve_target(
                     body: RequestBody::None,
                     update: None,
                     resolve_ref: None,
+                    max_lines: None,
                 })
             } else {
                 Ok(ToolTarget {
@@ -1397,6 +1704,7 @@ fn resolve_target(
                         sub_path,
                         trailing_slash: false,
                     }),
+                    max_lines: None,
                 })
             }
         }
@@ -1418,6 +1726,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_get_pull_request" => {
@@ -1447,6 +1756,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_list_pull_requests" => {
@@ -1477,6 +1787,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_list_pull_request_changes" => {
@@ -1506,6 +1817,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_get_pipeline_status" => {
@@ -1532,6 +1844,42 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
+            })
+        }
+        "bitbucket_get_pull_request_diff" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let pull_request_id = args
+                .get("pull_request_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing pull_request_id")?;
+            if pull_request_id.is_empty() || !pull_request_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err("pull_request_id must be a non-empty numeric id".into());
+            }
+            let max_lines = args
+                .get("max_lines")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(2000);
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::GET,
+                path: format!(
+                    "/repositories/{workspace}/{repo_slug}/pullrequests/{pull_request_id}/diff"
+                ),
+                body: RequestBody::None,
+                update: None,
+                resolve_ref: None,
+                max_lines: Some(max_lines),
             })
         }
         "bitbucket_create_branch" => {
@@ -1565,6 +1913,7 @@ fn resolve_target(
                 })),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_create_commit" => {
@@ -1625,6 +1974,7 @@ fn resolve_target(
                 body: RequestBody::form(form_fields),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_create_pull_request" => {
@@ -1670,6 +2020,7 @@ fn resolve_target(
                 body: RequestBody::json(body),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_merge_pull_request" => {
@@ -1707,6 +2058,7 @@ fn resolve_target(
                 body: RequestBody::json(body),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_decline_pull_request" => {
@@ -1736,6 +2088,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_delete_branch" => {
@@ -1764,6 +2117,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_add_pull_request_comment" => {
@@ -1800,6 +2154,7 @@ fn resolve_target(
                 body: RequestBody::json(body),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "bitbucket_create_repo" => {
@@ -1824,6 +2179,7 @@ fn resolve_target(
                 body: RequestBody::json(json!({ "is_private": is_private })),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "jira_update_issue" => {
@@ -1867,6 +2223,7 @@ fn resolve_target(
                     description_append,
                 }),
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "jira_get_transitions" => {
@@ -1887,6 +2244,7 @@ fn resolve_target(
                 body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
             })
         }
         "jira_transition_issue" => {
@@ -1914,6 +2272,94 @@ fn resolve_target(
                 body: RequestBody::json(json!({ "transition": { "id": transition_id } })),
                 update: None,
                 resolve_ref: None,
+                max_lines: None,
+            })
+        }
+        "jira_search_issues" => {
+            let args = args.ok_or("missing arguments")?;
+            let project = args
+                .get("project")
+                .and_then(|v| v.as_str())
+                .ok_or("missing project")?;
+            if project.is_empty() {
+                return Err("project must not be empty".into());
+            }
+
+            let jql_filter = args.get("jql_filter").and_then(|v| v.as_str());
+            if let Some(filter) = jql_filter {
+                if jql_project_override_regex().is_match(filter) {
+                    return Err("jql_filter must not contain project or projectKey tokens".into());
+                }
+                let mut paren_balance = 0i32;
+                for c in filter.chars() {
+                    match c {
+                        '(' => paren_balance += 1,
+                        ')' => {
+                            paren_balance -= 1;
+                            if paren_balance < 0 {
+                                return Err("jql_filter must have balanced parentheses".into());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if paren_balance != 0 {
+                    return Err("jql_filter must have balanced parentheses".into());
+                }
+            }
+
+            let max_results = args
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(50)
+                .min(100);
+
+            let jql = if let Some(filter) = jql_filter {
+                if filter.trim().is_empty() {
+                    format!("project = \"{project}\"")
+                } else {
+                    format!("project = \"{project}\" AND ({filter})")
+                }
+            } else {
+                format!("project = \"{project}\"")
+            };
+
+            Ok(ToolTarget {
+                workspace: None,
+                repo: None,
+                project: Some(project.to_string()),
+                space: None,
+                method: Method::POST,
+                path: "/rest/api/3/search/jql".into(),
+                body: RequestBody::json(json!({
+                    "jql": jql,
+                    "maxResults": max_results,
+                })),
+                update: None,
+                resolve_ref: None,
+                max_lines: None,
+            })
+        }
+        "jira_list_comments" => {
+            let args = args.ok_or("missing arguments")?;
+            let issue_key = args
+                .get("issue_key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing issue_key")?;
+            valid_issue_key(issue_key)?;
+            let project = issue_key.split_once('-').map(|(p, _)| p.to_string());
+            Ok(ToolTarget {
+                workspace: None,
+                repo: None,
+                project,
+                space: None,
+                method: Method::GET,
+                path: format!("/rest/api/3/issue/{issue_key}/comment"),
+                body: RequestBody::None,
+                update: None,
+                resolve_ref: None,
+                max_lines: None,
             })
         }
         _ => Err("unsupported tool".into()),
@@ -1951,6 +2397,72 @@ fn build_bitbucket_src_path(
         path.push('/');
     }
     path
+}
+
+enum ConfluenceTitleResult {
+    Found(String),
+    NotFound(String),
+    Multiple(String),
+}
+
+/// Resolve a Confluence page title to a single page ID.
+///
+/// `list_path` must be `/wiki/api/v2/spaces/{space_id}/pages?title={encoded_title}`.
+async fn resolve_confluence_page_by_title<C: UpstreamClient>(
+    client: &C,
+    list_path: &str,
+) -> Result<ConfluenceTitleResult, (StatusCode, String)> {
+    let request = client
+        .build_request(Method::GET, list_path, RequestBody::None)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let response = client.execute(request).await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("upstream GET failed: {}", e),
+        )
+    })?;
+    if !response.status().is_success() {
+        return Err((
+            StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            format!("upstream GET returned {}", response.status()),
+        ));
+    }
+    let body: Value = response.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to parse upstream GET response: {}", e),
+        )
+    })?;
+    let results = body
+        .get("results")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "upstream response did not contain a results array".into(),
+            )
+        })?;
+    match results.len() {
+        0 => Ok(ConfluenceTitleResult::NotFound(
+            "no Confluence page found with the given title".into(),
+        )),
+        1 => {
+            let page_id = results[0]
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        "upstream page result missing id".into(),
+                    )
+                })?;
+            Ok(ConfluenceTitleResult::Found(page_id.to_string()))
+        }
+        _ => Ok(ConfluenceTitleResult::Multiple(
+            "multiple Confluence pages found with the given title; please use page_id".into(),
+        )),
+    }
 }
 
 /// Build the upstream PUT body for `jira_update_issue`.
@@ -2105,7 +2617,7 @@ mod tests {
     use crate::upstream::JiraClient;
     use axum::body::Body;
     use axum::extract::{Path, Query};
-    use axum::http::{Request, StatusCode};
+    use axum::http::{header, Request, StatusCode};
     use axum::routing::{delete, get, post};
     use axum::Router;
     use serde_json::{json, Value};
@@ -2149,6 +2661,8 @@ mod tests {
                     "jira_update_issue".into(),
                     "jira_get_transitions".into(),
                     "jira_transition_issue".into(),
+                    "jira_search_issues".into(),
+                    "jira_list_comments".into(),
                 ],
                 projects: vec!["PROJ".into()],
                 spaces: vec![],
@@ -2186,6 +2700,8 @@ mod tests {
                     "confluence_get_page".into(),
                     "confluence_create_page".into(),
                     "confluence_update_page".into(),
+                    "confluence_list_pages".into(),
+                    "confluence_delete_page".into(),
                 ],
                 projects: vec![],
                 spaces,
@@ -2225,6 +2741,7 @@ mod tests {
                     "bitbucket_list_pull_requests".into(),
                     "bitbucket_list_pull_request_changes".into(),
                     "bitbucket_get_pipeline_status".into(),
+                    "bitbucket_get_pull_request_diff".into(),
                     "bitbucket_list_branches".into(),
                     "bitbucket_list_directory".into(),
                     "bitbucket_get_file_content".into(),
@@ -2389,17 +2906,57 @@ mod tests {
             }))
         };
 
+        let search_handler = |State(s): State<MockState>, headers: HeaderMap, body: Bytes| async move {
+            s.headers.lock().unwrap().push(headers);
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_default();
+            Json(json!({
+                "isLast": true,
+                "maxResults": payload["maxResults"],
+                "total": 1,
+                "issues": [
+                    {
+                        "id": "10000",
+                        "key": "PROJ-123",
+                        "fields": { "summary": "Test issue" }
+                    }
+                ],
+                "jql": payload["jql"]
+            }))
+        };
+
+        let list_comments_handler =
+            |State(s): State<MockState>, Path(_): Path<String>, headers: HeaderMap| async move {
+                s.headers.lock().unwrap().push(headers);
+                Json(json!({
+                    "startAt": 0,
+                    "maxResults": 10,
+                    "total": 1,
+                    "comments": [
+                        {
+                            "id": "10001",
+                            "author": { "displayName": "Alice" },
+                            "body": { "type": "doc", "version": 1, "content": [] },
+                            "created": "2026-01-01T00:00:00.000+0000"
+                        }
+                    ]
+                }))
+            };
+
         let app = Router::new()
             .route(
                 "/rest/api/3/issue/{key}",
                 get(get_handler).put(update_handler),
             )
             .route("/rest/api/3/issue", post(post_handler))
-            .route("/rest/api/3/issue/{key}/comment", post(comment_handler))
+            .route(
+                "/rest/api/3/issue/{key}/comment",
+                get(list_comments_handler).post(comment_handler),
+            )
             .route(
                 "/rest/api/3/issue/{key}/transitions",
                 get(get_transitions_handler).post(do_transition_handler),
             )
+            .route("/rest/api/3/search/jql", post(search_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2480,12 +3037,62 @@ mod tests {
             }))
         };
 
+        let list_handler = |State(s): State<MockState>,
+                            Path(space_id): Path<String>,
+                            Query(query): Query<std::collections::HashMap<String, String>>,
+                            headers: HeaderMap| async move {
+            s.headers.lock().unwrap().push(headers);
+            let title = query.get("title").cloned().unwrap_or_default();
+            let response = if title == "Unique Page" {
+                json!({
+                    "results": [
+                        { "id": "456", "title": "Unique Page", "spaceId": space_id }
+                    ],
+                    "_links": { "base": "https://example.atlassian.net/wiki" }
+                })
+            } else if title == "No Such Page" {
+                json!({
+                    "results": [],
+                    "_links": { "base": "https://example.atlassian.net/wiki" }
+                })
+            } else if title == "Ambiguous" {
+                json!({
+                    "results": [
+                        { "id": "456", "title": "Ambiguous", "spaceId": space_id },
+                        { "id": "457", "title": "Ambiguous", "spaceId": space_id }
+                    ],
+                    "_links": { "base": "https://example.atlassian.net/wiki" }
+                })
+            } else {
+                let has_next = space_id == "999";
+                let mut r = json!({
+                    "results": [
+                        { "id": "123", "title": "Page 1", "spaceId": space_id },
+                        { "id": "124", "title": "Page 2", "spaceId": space_id }
+                    ],
+                    "_links": { "base": "https://example.atlassian.net/wiki" }
+                });
+                if has_next {
+                    r["next"] = json!("/wiki/api/v2/spaces/999/pages?cursor=abc");
+                }
+                r
+            };
+            Json(response)
+        };
+
+        let delete_handler =
+            |State(s): State<MockState>, Path(_id): Path<String>, headers: HeaderMap| async move {
+                s.headers.lock().unwrap().push(headers);
+                StatusCode::NO_CONTENT
+            };
+
         let app = Router::new()
             .route(
                 "/wiki/api/v2/pages/{id}",
-                get(get_handler).put(update_handler),
+                get(get_handler).put(update_handler).delete(delete_handler),
             )
             .route("/wiki/api/v2/pages", post(create_handler))
+            .route("/wiki/api/v2/spaces/{space_id}/pages", get(list_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3647,6 +4254,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_jira_search_issues_uses_forced_project_prefix() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_search_issues",
+                json!({"project": "PROJ", "jql_filter": "status = \"In Progress\"", "max_results": 10}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        let jql = json["result"]["structuredContent"]["jql"].as_str().unwrap();
+        assert!(jql.starts_with("project = \"PROJ\" AND"));
+        assert!(jql.contains("status = \"In Progress\""));
+        assert_eq!(json["result"]["structuredContent"]["maxResults"], 10);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_search_issues_rejects_project_override_in_filter() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_search_issues",
+                json!({"project": "PROJ", "jql_filter": "project = \"OTHER\""}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_search_issues_rejects_unbalanced_parentheses_bypass() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_search_issues",
+                json!({"project": "PROJ", "jql_filter": "1=1) OR (1=1"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_search_issues_clamps_max_results() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_search_issues",
+                json!({"project": "PROJ", "max_results": 500}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(json["result"]["structuredContent"]["maxResults"], 100);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_search_issues_forbidden_project_returns_policy_error() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_search_issues",
+                json!({"project": "OTHER"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not permitted by agent policy"));
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_list_comments_allowed_and_strips_headers() {
+        let (port, captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_list_comments",
+                json!({"issue_key": "PROJ-123"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        let comments = json["result"]["structuredContent"]["comments"]
+            .as_array()
+            .unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0]["author"]["displayName"], "Alice");
+
+        let upstream_headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            upstream_headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer test-token"
+        );
+        assert!(upstream_headers.get("cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_list_comments_forbidden_project_returns_policy_error() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_list_comments",
+                json!({"issue_key": "OTHER-123"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not permitted by agent policy"));
+    }
+
+    #[tokio::test]
     async fn mcp_confluence_get_page_allows_and_strips_headers() {
         let (port, captured) = mock_confluence_server().await;
         let config = confluence_test_config(
@@ -4259,6 +5093,437 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn mcp_confluence_list_pages_allowed_and_has_pagination_hint() {
+        let (port, captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_list_pages",
+                json!({"space": "SPACE", "space_id": "12345"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        let results = json["result"]["structuredContent"]["results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(json["result"]["structuredContent"]["has_more"], false);
+
+        let upstream_headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            upstream_headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer test-token"
+        );
+        assert!(upstream_headers.get("cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_list_pages_has_more_when_next_present() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_list_pages",
+                json!({"space": "SPACE", "space_id": "999"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(json["result"]["structuredContent"]["has_more"], true);
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_list_pages_forbidden_space_returns_policy_error() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["OTHER".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_list_pages",
+                json!({"space": "SPACE", "space_id": "12345"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not permitted by agent policy"));
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_delete_page_allowed_and_audited() {
+        let audit_path = temp_audit_path();
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            Some(audit_path.clone()),
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let audit = Some(AuditLog::new(audit_path.clone()));
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_delete_page",
+                json!({"space": "SPACE", "page_id": "67890"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+
+        let content = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(content.contains("\"result\":\"attempt\""));
+        assert!(content.contains("\"result\":\"success\""));
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_delete_page_write_disabled_returns_policy_error() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_delete_page",
+                json!({"space": "SPACE", "page_id": "67890"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("write tools not enabled for agent"));
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_delete_page_rejects_invalid_page_id() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_delete_page",
+                json!({"space": "SPACE", "page_id": "abc"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_get_page_by_title_resolves_and_returns_body() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_get_page",
+                json!({"space": "SPACE", "space_id": "12345", "title": "Unique Page"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(json["result"]["structuredContent"]["id"], "456");
+        assert!(json["result"]["structuredContent"]["body"]["view"]["value"]
+            .as_str()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_get_page_by_title_not_found_returns_calltool_error() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_get_page",
+                json!({"space": "SPACE", "space_id": "12345", "title": "No Such Page"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("no Confluence page found"));
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_get_page_by_title_ambiguous_returns_calltool_error() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_get_page",
+                json!({"space": "SPACE", "space_id": "12345", "title": "Ambiguous"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("multiple Confluence pages found"));
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_get_page_by_page_id_still_works() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_get_page",
+                json!({"space": "SPACE", "page_id": "67890"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(json["result"]["structuredContent"]["id"], "67890");
+    }
+
+    async fn mock_bitbucket_and_cdn_servers() -> (u16, u16, Arc<Mutex<Vec<HeaderMap>>>) {
+        #[derive(Clone)]
+        struct CdnState {
+            headers: Arc<Mutex<Vec<HeaderMap>>>,
+        }
+
+        let cdn_state = CdnState {
+            headers: Arc::new(Mutex::new(Vec::new())),
+        };
+        let cdn_captured = cdn_state.headers.clone();
+
+        let cdn_handler = |State(s): State<CdnState>, headers: HeaderMap| async move {
+            s.headers.lock().unwrap().push(headers);
+            (
+                StatusCode::OK,
+                "diff --git a/src/main.rs b/src/main.rs\n+new line\n",
+            )
+        };
+
+        let cdn_app = Router::new()
+            .route("/diff", get(cdn_handler))
+            .with_state(cdn_state);
+        let cdn_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cdn_port = cdn_listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(cdn_listener, cdn_app).await.unwrap() });
+
+        let redirect_handler =
+            move |Path((_workspace, _repo, _pr_id)): Path<(String, String, String)>,
+                  headers: HeaderMap| async move {
+                let _ = headers;
+                let location = format!("http://127.0.0.1:{}/diff", cdn_port);
+                (StatusCode::FOUND, [(header::LOCATION, location)], "")
+            };
+
+        let bitbucket_app = Router::new().route(
+            "/repositories/{workspace}/{repo}/pullrequests/{pr_id}/diff",
+            get(redirect_handler),
+        );
+        let bitbucket_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bitbucket_port = bitbucket_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(bitbucket_listener, bitbucket_app)
+                .await
+                .unwrap()
+        });
+
+        (bitbucket_port, cdn_port, cdn_captured)
+    }
+
     async fn mock_bitbucket_server() -> (u16, Arc<Mutex<Vec<HeaderMap>>>, Arc<Mutex<Vec<String>>>) {
         #[derive(Clone)]
         struct MockState {
@@ -4330,6 +5595,39 @@ mod tests {
                 "pullrequest": { "id": pr_id, "title": "PR title" },
                 "repository": { "full_name": format!("{workspace}/{repo}") }
             }))
+        };
+
+        let diff_handler = |State(s): State<MockState>,
+                            Path((_workspace, _repo, pr_id)): Path<(String, String, String)>,
+                            headers: HeaderMap| async move {
+            s.headers.lock().unwrap().push(headers);
+            if pr_id == "43" {
+                // Return invalid UTF-8 bytes to simulate a binary diff.
+                return (StatusCode::OK, vec![0xffu8, 0xfe, 0xfd, 0xfc]).into_response();
+            }
+
+            if pr_id == "44" {
+                let body = (0..2500)
+                    .map(|i| format!("+line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return (StatusCode::OK, body).into_response();
+            }
+
+            let body = format!(
+                "diff --git a/src/main.rs b/src/main.rs\n\
+index abc..def 100644\n\
+--- a/src/main.rs\n\
++++ b/src/main.rs\n\
+@@ -1,3 +1,6 @@\n\
++aws = \"AKIA0123456789ABCDEF\"\n\
++openai = \"sk-abcdefghijklmnopqrstuvwxyz\"\n\
++token = \"Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature\"\n\
+ fn main() {{\n\
+     println!(\"hello\");\n\
+ }}\n"
+            );
+            (StatusCode::OK, body).into_response()
         };
 
         let pipeline_status_handler = |State(s): State<MockState>,
@@ -4618,6 +5916,10 @@ mod tests {
             .route(
                 "/repositories/{workspace}/{repo}/pullrequests/{pr_id}/diffstat",
                 get(diffstat_handler),
+            )
+            .route(
+                "/repositories/{workspace}/{repo}/pullrequests/{pr_id}/diff",
+                get(diff_handler),
             )
             .route(
                 "/repositories/{workspace}/{repo}/pipelines/",
@@ -5127,6 +6429,242 @@ mod tests {
         assert_eq!(json["result"]["isError"], true);
         let text = json["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("not permitted by agent policy"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_diff_returns_redacted_raw_diff() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request_diff",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        let diff = json["result"]["structuredContent"]["diff"]
+            .as_str()
+            .unwrap();
+        assert!(diff.contains("diff --git"));
+        assert!(diff.contains("[REDACTED]"));
+        assert!(!diff.contains("AKIA0123456789ABCDEF"));
+        assert!(!diff.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+        assert!(!diff.contains("Bearer eyJhbGciOiJIUzI1NiJ9"));
+        assert_eq!(json["result"]["structuredContent"]["total_lines"], 11);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_diff_truncates_with_max_lines() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request_diff",
+                json!({"repo_slug": "my-repo", "pull_request_id": "44", "max_lines": 100}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(json["result"]["structuredContent"]["total_lines"], 2500);
+        assert_eq!(json["result"]["structuredContent"]["truncated"], true);
+        let diff = json["result"]["structuredContent"]["diff"]
+            .as_str()
+            .unwrap();
+        let diff_lines: Vec<&str> = diff.lines().collect();
+        // 100 content lines + the truncation marker line.
+        assert_eq!(diff_lines.len(), 101);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_diff_binary_marked() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request_diff",
+                json!({"repo_slug": "my-repo", "pull_request_id": "43"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(
+            json["result"]["structuredContent"]["diff"],
+            "[binary file, diff not shown]"
+        );
+        assert_eq!(json["result"]["structuredContent"]["binary"], true);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_diff_invalid_pr_id_returns_400() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request_diff",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42abc"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_diff_allowlist_blocks_repo() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["allowed-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request_diff",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not permitted by agent policy"));
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_get_pull_request_diff_strips_auth_on_cross_host_redirect() {
+        let (bb_port, _cdn_port, cdn_captured) = mock_bitbucket_and_cdn_servers().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", bb_port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_get_pull_request_diff",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+
+        let cdn_headers = cdn_captured.lock().unwrap().pop().unwrap();
+        assert!(
+            cdn_headers.get("authorization").is_none(),
+            "Authorization header leaked to CDN redirect target"
+        );
     }
 
     #[tokio::test]

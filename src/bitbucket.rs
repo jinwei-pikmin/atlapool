@@ -68,6 +68,11 @@ impl BitbucketClient {
             TokenProvider::Static(token)
         };
 
+        // Use the default reqwest client. Its default redirect policy strips
+        // sensitive headers such as `Authorization` when following cross-host
+        // redirects (e.g. Bitbucket diff endpoints that redirect to a CDN).
+        // This security property is pinned by
+        // `mcp_bitbucket_get_pull_request_diff_strips_auth_on_cross_host_redirect`.
         Ok(Self {
             client: Client::new(),
             base_url,

@@ -6,9 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Jira tools:
+  - Read: `jira_search_issues` with forced `project = "..."` JQL prefix, `project`/`projectKey` keyword blacklist, and `max_results` clamping
+
+### Fixed
+
+- `jira_search_issues`: reject `jql_filter` with unbalanced parentheses to prevent bypassing the forced `project = "..."` wrapper (e.g. `1=1) OR (1=1`)
+- `jira_search_issues`: migrate Jira endpoint from deprecated `/rest/api/3/search` to `/rest/api/3/search/jql`; add `has_more` hint from `nextPageToken`
+
+### Added
+
+- Jira tools:
+  - Read: `jira_list_comments`
+- Confluence tools:
+  - Read: `confluence_get_page` now supports lookup by `space` + `title` in addition to `page_id`
+  - Read: `confluence_list_pages` with `has_more` pagination hint
+  - Write: `confluence_delete_page` with write-gate and fail-closed audit
 - Bitbucket tools:
   - Browse: `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`, `bitbucket_list_pull_requests` (with `has_more` pagination hint), `bitbucket_list_pull_request_changes` (diffstat only)
   - Read: `bitbucket_get_pipeline_status` with Bitbucket Pipelines state/result normalization
+  - Read: `bitbucket_get_pull_request_diff` with secret redaction, binary detection, and `max_lines` truncation
   - Write: `bitbucket_merge_pull_request` (merge_commit strategy, optional `close_source_branch`)
   - Write: `bitbucket_decline_pull_request` and `bitbucket_delete_branch`
   - Write: `bitbucket_add_pull_request_comment`

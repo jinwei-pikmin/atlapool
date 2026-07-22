@@ -363,14 +363,19 @@ Example `tools/call` envelope:
 | `jira_update_issue` | Update a Jira issue (summary, assignee, or append description) | `issue_key` and at least one of `summary`, `assignee`, or `description_append` | `projects` (parsed from key) | Yes | Yes |
 | `jira_get_transitions` | List available transitions for a Jira issue | `issue_key` | `projects` (parsed from key) | No | No |
 | `jira_transition_issue` | Transition a Jira issue to a new status | `issue_key`, `transition_id` | `projects` (parsed from key) | Yes | Yes |
-| `confluence_get_page` | Fetch a Confluence page by ID | `page_id` (numeric page ID), `space` (key for allowlist) | `spaces` | No | No |
+| `jira_search_issues` | Search Jira issues within a project using JQL | `project` (key, required), optional `jql_filter`, optional `max_results` (default 50, capped at 100) | `projects` (from `project`) | No | No |
+| `jira_list_comments` | List comments on a Jira issue | `issue_key` (e.g. `PROJ-123`) | `projects` (parsed from key) | No | No |
+| `confluence_get_page` | Fetch a Confluence page by ID or by space + title | `space` (key for allowlist) and either `page_id` or `space_id` + `title` | `spaces` | No | No |
 | `confluence_create_page` | Create a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `title`, `body` (storage HTML), optional `parent_id` (numeric page ID) | `spaces` | Yes | Yes |
 | `confluence_update_page` | Update a Confluence page | `space` (key for allowlist), `space_id` (numeric ID), `page_id` (numeric ID), `title`, `version`, `body` (storage HTML) | `spaces` | Yes | Yes |
+| `confluence_list_pages` | List pages in a Confluence space | `space` (key for allowlist), `space_id` (numeric ID) | `spaces` | No | No |
+| `confluence_delete_page` | Delete a Confluence page | `space` (key for allowlist), `page_id` (numeric ID) | `spaces` | Yes | Yes |
 | `bitbucket_get_repo` | Fetch a Bitbucket repository | `repo_slug` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_get_pull_request` | Fetch a Bitbucket pull request | `repo_slug`, `pull_request_id` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_get_pipeline_status` | Get latest Bitbucket Pipelines status for a branch | `repo_slug`, `branch` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_list_pull_requests` | List pull requests in a repository | `repo_slug`, optional `state` (`OPEN`, `MERGED`, `DECLINED`, `SUPERSEDED`; default `OPEN`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_list_pull_request_changes` | List changed files and line statistics for a pull request (diffstat) | `repo_slug`, `pull_request_id` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
+| `bitbucket_get_pull_request_diff` | Get the raw diff of a pull request with secret redaction and optional line truncation | `repo_slug`, `pull_request_id`, optional `max_lines` (default 2000) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_list_branches` | List branches in a Bitbucket repository | `repo_slug` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_list_directory` | List files/directories at a path in a repo | `repo_slug`, optional `path`, optional `ref` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_get_file_content` | Read the raw contents of a file in a repo | `repo_slug`, `path`, optional `ref` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
@@ -859,7 +864,7 @@ Choose one of the following authentication methods:
    before expiry. The consumer must be granted at least:
 
    - `repository:read` — for `bitbucket_get_repo`, `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`
-   - `pullrequest:read` — for `bitbucket_get_pull_request`, `bitbucket_list_pull_requests`, `bitbucket_list_pull_request_changes`
+   - `pullrequest:read` — for `bitbucket_get_pull_request`, `bitbucket_list_pull_requests`, `bitbucket_list_pull_request_changes`, `bitbucket_get_pull_request_diff`
    - `pipeline` — for `bitbucket_get_pipeline_status` (read-only; `pipeline:write` is not required)
    - `repository:write` — for `bitbucket_create_branch`, `bitbucket_create_commit`
    - `repository:admin` — for `bitbucket_create_repo` (Bitbucket's API requires admin scope to create repositories; this is different from `repository:write`)
@@ -904,7 +909,7 @@ Scope-to-tool mapping:
 - `repository:admin` — `bitbucket_create_repo` (Bitbucket requires admin scope for repository creation)
 - `repository:read` — `bitbucket_get_repo`, `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`
 - `repository:write` — `bitbucket_create_branch`, `bitbucket_create_commit`, `bitbucket_delete_branch`
-- `pullrequest:read` — `bitbucket_get_pull_request`, `bitbucket_list_pull_requests`, `bitbucket_list_pull_request_changes`
+- `pullrequest:read` — `bitbucket_get_pull_request`, `bitbucket_list_pull_requests`, `bitbucket_list_pull_request_changes`, `bitbucket_get_pull_request_diff`
 - `pipeline` — `bitbucket_get_pipeline_status` (read-only; `pipeline:write` is not required)
 - `pullrequest:write` — `bitbucket_create_pull_request`, `bitbucket_merge_pull_request`, `bitbucket_decline_pull_request`, `bitbucket_add_pull_request_comment`
 
@@ -922,7 +927,7 @@ Scope-to-tool mapping:
 ### Read vs. write and audit
 
 Read tools (`jira_get_issue`, `confluence_get_page`, `bitbucket_get_repo`,
-`bitbucket_get_pull_request`, `bitbucket_get_pipeline_status`, `bitbucket_list_pull_requests`, `bitbucket_list_pull_request_changes`,
+`bitbucket_get_pull_request`, `bitbucket_get_pipeline_status`, `bitbucket_get_pull_request_diff`, `bitbucket_list_pull_requests`, `bitbucket_list_pull_request_changes`,
 `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`) pass through the allowlist and do not touch the
 audit log.
 
@@ -950,6 +955,41 @@ consumption:
 If no pipelines are configured for the repository or no runs exist for the
 requested branch, the tool returns `normalized_status: "unknown"` with an
 informative message and `isError: false`.
+
+#### `bitbucket_get_pull_request_diff` secret redaction
+
+`bitbucket_get_pull_request_diff` returns raw diff text and applies lightweight
+regex redaction for a few common secret patterns (e.g. AWS access keys,
+OpenAI-style keys, and `Bearer <token>` strings). Any match is replaced with
+`[REDACTED]`.
+
+> **This is a basic safety net, not a complete DLP solution.** It cannot catch
+> every possible secret format, encoded values, or obfuscated credentials. You
+> must still treat diffs as potentially sensitive and review them carefully.
+
+Binary files are reported as `[binary file, diff not shown]` instead of being
+forced into the text response. `max_lines` defaults to 2000; when the diff is
+truncated, the response includes `truncated: true` and the original
+`total_lines`.
+
+#### `jira_search_issues` JQL sandbox
+
+`jira_search_issues` never sends a raw `jql_filter` to Jira. Instead it builds a
+final JQL string that is always prefixed with `project = "<project>"` (and
+optionally `AND (<jql_filter>)`). The `project` argument is also checked against
+the agent's `projects` allowlist before any upstream call.
+
+To prevent `jql_filter` from trying to override the project scope, the filter is
+rejected (400) if:
+
+- It contains the tokens `project` or `projectKey` (case-insensitive).
+- Its parentheses are unbalanced, which could break the outer `AND (...)`
+  wrapper (e.g. `1=1) OR (1=1`).
+
+This is a lightweight keyword blacklist plus a simple parenthesis scan, not a
+full JQL parser: it blocks the common bypass paths without over-engineering the
+parser, but it may reject filters that merely mention the word "project" in a
+string value.
 
 Audit guarantee:
 
