@@ -376,6 +376,8 @@ Example `tools/call` envelope:
 | `bitbucket_create_commit` | Create a commit by uploading files | `repo_slug`, `message`, `branch`, `files` (map of path → content) | `bitbucket_workspaces`, `bitbucket_repos` | Yes | Yes |
 | `bitbucket_create_pull_request` | Create a pull request | `repo_slug`, `title`, `source_branch`, optional `destination_branch`, `description` | `bitbucket_workspaces`, `bitbucket_repos` | Yes | Yes |
 | `bitbucket_merge_pull_request` | Merge a pull request using `merge_commit` strategy | `repo_slug`, `pull_request_id`, optional `close_source_branch` (default `true`) | `bitbucket_workspaces`, `bitbucket_repos` | Yes | Yes |
+| `bitbucket_decline_pull_request` | Decline a pull request without merging | `repo_slug`, `pull_request_id` | `bitbucket_workspaces`, `bitbucket_repos` | Yes | Yes |
+| `bitbucket_delete_branch` | Delete a branch in a repository | `repo_slug`, `branch_name` (may contain `/`) | `bitbucket_workspaces`, `bitbucket_repos` | Yes | Yes |
 
 The allowlist is deny-by-default: an agent must list the exact tool name and
 must also match the `project`, `space`, `bitbucket_workspaces`, or `bitbucket_repos`
@@ -893,9 +895,9 @@ Scope-to-tool mapping:
 
 - `repository:admin` — `bitbucket_create_repo` (Bitbucket requires admin scope for repository creation)
 - `repository:read` — `bitbucket_get_repo`, `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`
-- `repository:write` — `bitbucket_create_branch`, `bitbucket_create_commit`
+- `repository:write` — `bitbucket_create_branch`, `bitbucket_create_commit`, `bitbucket_delete_branch`
 - `pullrequest:read` — `bitbucket_get_pull_request`
-- `pullrequest:write` — `bitbucket_create_pull_request`, `bitbucket_merge_pull_request`
+- `pullrequest:write` — `bitbucket_create_pull_request`, `bitbucket_merge_pull_request`, `bitbucket_decline_pull_request`
 
 ### Agent allowlists
 
@@ -918,7 +920,8 @@ audit log.
 Write tools (`jira_create_issue`, `jira_add_comment`, `confluence_create_page`,
 `confluence_update_page`, `bitbucket_create_repo`, `bitbucket_create_branch`,
 `bitbucket_create_commit`, `bitbucket_create_pull_request`,
-`bitbucket_merge_pull_request`) require a configured
+`bitbucket_merge_pull_request`, `bitbucket_decline_pull_request`,
+`bitbucket_delete_branch`) require a configured
 `audit.path` and `enable_writes` to be `true` for the agent (per-agent value if
 set, otherwise `[mcp] enable_writes`).
 
