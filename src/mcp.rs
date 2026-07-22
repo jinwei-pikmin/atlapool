@@ -2287,6 +2287,22 @@ fn resolve_target(
                 if jql_project_override_regex().is_match(filter) {
                     return Err("jql_filter must not contain project or projectKey tokens".into());
                 }
+                let mut paren_balance = 0i32;
+                for c in filter.chars() {
+                    match c {
+                        '(' => paren_balance += 1,
+                        ')' => {
+                            paren_balance -= 1;
+                            if paren_balance < 0 {
+                                return Err("jql_filter must have balanced parentheses".into());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if paren_balance != 0 {
+                    return Err("jql_filter must have balanced parentheses".into());
+                }
             }
 
             let max_results = args
@@ -4287,6 +4303,32 @@ mod tests {
             .oneshot(build_request(
                 "jira_search_issues",
                 json!({"project": "PROJ", "jql_filter": "project = \"OTHER\""}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_search_issues_rejects_unbalanced_parentheses_bypass() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(format!("http://127.0.0.1:{}", port), false, None);
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "jira_search_issues",
+                json!({"project": "PROJ", "jql_filter": "1=1) OR (1=1"}),
                 Some("agent-key"),
             ))
             .await
