@@ -493,7 +493,7 @@ async fn forward<C: UpstreamClient>(
 
     // Add a pagination hint for list-style upstream responses.
     if let Some(obj) = upstream_body.as_object_mut() {
-        if obj.get("values").is_some() {
+        if obj.get("values").is_some() || obj.get("results").is_some() {
             let has_more = obj.get("next").is_some();
             obj.insert("has_more".to_string(), json!(has_more));
         }
@@ -904,6 +904,32 @@ fn all_tools() -> Vec<Tool> {
                     "body": { "type": "string", "description": "Storage-format HTML" }
                 },
                 "required": ["space", "space_id", "page_id", "title", "version", "body"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "confluence_list_pages",
+            description: "List pages in a Confluence space.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "space": { "type": "string", "description": "Space key for allowlist" },
+                    "space_id": { "type": "string", "description": "Numeric space ID" }
+                },
+                "required": ["space", "space_id"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "confluence_delete_page",
+            description: "Delete a Confluence page.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "space": { "type": "string", "description": "Space key for allowlist" },
+                    "page_id": { "type": "string", "description": "Numeric page ID" }
+                },
+                "required": ["space", "page_id"],
                 "additionalProperties": false
             }),
         },
@@ -1435,6 +1461,66 @@ fn resolve_target(
                     "version": { "number": version },
                     "body": body_value
                 })),
+                update: None,
+                resolve_ref: None,
+                max_lines: None,
+            })
+        }
+        "confluence_list_pages" => {
+            let args = args.ok_or("missing arguments")?;
+            let space = args
+                .get("space")
+                .and_then(|v| v.as_str())
+                .ok_or("missing space")?
+                .to_string();
+            if space.is_empty() {
+                return Err("space must not be empty".into());
+            }
+            let space_id = args
+                .get("space_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing space_id")?;
+            if space_id.is_empty() || !space_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err("space_id must be a non-empty numeric id".into());
+            }
+            Ok(ToolTarget {
+                workspace: None,
+                repo: None,
+                project: None,
+                space: Some(space),
+                method: Method::GET,
+                path: format!("/wiki/api/v2/spaces/{space_id}/pages"),
+                body: RequestBody::None,
+                update: None,
+                resolve_ref: None,
+                max_lines: None,
+            })
+        }
+        "confluence_delete_page" => {
+            let args = args.ok_or("missing arguments")?;
+            let space = args
+                .get("space")
+                .and_then(|v| v.as_str())
+                .ok_or("missing space")?
+                .to_string();
+            if space.is_empty() {
+                return Err("space must not be empty".into());
+            }
+            let page_id = args
+                .get("page_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing page_id")?;
+            if page_id.is_empty() || !page_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err("page_id must be a non-empty numeric id".into());
+            }
+            Ok(ToolTarget {
+                workspace: None,
+                repo: None,
+                project: None,
+                space: Some(space),
+                method: Method::DELETE,
+                path: format!("/wiki/api/v2/pages/{page_id}"),
+                body: RequestBody::None,
                 update: None,
                 resolve_ref: None,
                 max_lines: None,
@@ -2450,6 +2536,8 @@ mod tests {
                     "confluence_get_page".into(),
                     "confluence_create_page".into(),
                     "confluence_update_page".into(),
+                    "confluence_list_pages".into(),
+                    "confluence_delete_page".into(),
                 ],
                 projects: vec![],
                 spaces,
@@ -2765,12 +2853,39 @@ mod tests {
             }))
         };
 
+        let list_handler = |State(s): State<MockState>,
+                            Path(space_id): Path<String>,
+                            headers: HeaderMap| async move {
+            s.headers.lock().unwrap().push(headers);
+            let has_next = space_id == "999";
+            let mut response = json!({
+                "results": [
+                    { "id": "123", "title": "Page 1", "spaceId": space_id },
+                    { "id": "124", "title": "Page 2", "spaceId": space_id }
+                ],
+                "_links": {
+                    "base": "https://example.atlassian.net/wiki"
+                }
+            });
+            if has_next {
+                response["next"] = json!("/wiki/api/v2/spaces/999/pages?cursor=abc");
+            }
+            Json(response)
+        };
+
+        let delete_handler =
+            |State(s): State<MockState>, Path(_id): Path<String>, headers: HeaderMap| async move {
+                s.headers.lock().unwrap().push(headers);
+                StatusCode::NO_CONTENT
+            };
+
         let app = Router::new()
             .route(
                 "/wiki/api/v2/pages/{id}",
-                get(get_handler).put(update_handler),
+                get(get_handler).put(update_handler).delete(delete_handler),
             )
             .route("/wiki/api/v2/pages", post(create_handler))
+            .route("/wiki/api/v2/spaces/{space_id}/pages", get(list_handler))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4664,6 +4779,239 @@ mod tests {
             ))
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_list_pages_allowed_and_has_pagination_hint() {
+        let (port, captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_list_pages",
+                json!({"space": "SPACE", "space_id": "12345"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        let results = json["result"]["structuredContent"]["results"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(json["result"]["structuredContent"]["has_more"], false);
+
+        let upstream_headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            upstream_headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer test-token"
+        );
+        assert!(upstream_headers.get("cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_list_pages_has_more_when_next_present() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_list_pages",
+                json!({"space": "SPACE", "space_id": "999"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(json["result"]["structuredContent"]["has_more"], true);
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_list_pages_forbidden_space_returns_policy_error() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["OTHER".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_list_pages",
+                json!({"space": "SPACE", "space_id": "12345"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not permitted by agent policy"));
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_delete_page_allowed_and_audited() {
+        let audit_path = temp_audit_path();
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            Some(audit_path.clone()),
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let audit = Some(AuditLog::new(audit_path.clone()));
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_delete_page",
+                json!({"space": "SPACE", "page_id": "67890"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+
+        let content = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(content.contains("\"result\":\"attempt\""));
+        assert!(content.contains("\"result\":\"success\""));
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_delete_page_write_disabled_returns_policy_error() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            false,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_delete_page",
+                json!({"space": "SPACE", "page_id": "67890"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("write tools not enabled for agent"));
+    }
+
+    #[tokio::test]
+    async fn mcp_confluence_delete_page_rejects_invalid_page_id() {
+        let (port, _captured) = mock_confluence_server().await;
+        let config = confluence_test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            None,
+            vec!["SPACE".into()],
+        );
+        let confluence = ConfluenceClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: Some(confluence),
+            bitbucket: None,
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "confluence_delete_page",
+                json!({"space": "SPACE", "page_id": "abc"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
