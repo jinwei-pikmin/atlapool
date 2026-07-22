@@ -117,8 +117,8 @@ enabled = false
 #   jira_update_issue, jira_get_transitions, jira_transition_issue,
 #   confluence_get_page, confluence_create_page, confluence_update_page,
 #   bitbucket_get_repo, bitbucket_get_pull_request,
-#   bitbucket_list_pull_requests, bitbucket_list_branches,
-#   bitbucket_list_directory, bitbucket_get_file_content,
+#   bitbucket_list_pull_requests, bitbucket_list_pull_request_changes,
+#   bitbucket_list_branches, bitbucket_list_directory, bitbucket_get_file_content,
 #   bitbucket_create_repo, bitbucket_create_branch, bitbucket_create_commit,
 #   bitbucket_create_pull_request, bitbucket_merge_pull_request,
 #   bitbucket_decline_pull_request, bitbucket_delete_branch,
@@ -127,8 +127,9 @@ enabled = false
 #          "jira_update_issue", "jira_get_transitions", "jira_transition_issue",
 #          "confluence_get_page", "confluence_create_page", "confluence_update_page",
 #          "bitbucket_get_repo", "bitbucket_get_pull_request",
-#          "bitbucket_list_pull_requests", "bitbucket_list_branches",
-#          "bitbucket_list_directory", "bitbucket_get_file_content",
+#          "bitbucket_list_pull_requests", "bitbucket_list_pull_request_changes",
+#          "bitbucket_list_branches", "bitbucket_list_directory",
+#          "bitbucket_get_file_content",
 #          "bitbucket_create_repo", "bitbucket_create_branch",
 #          "bitbucket_create_commit", "bitbucket_create_pull_request",
 #          "bitbucket_merge_pull_request", "bitbucket_decline_pull_request",
@@ -145,5 +146,6 @@ enabled = false
 # bitbucket_add_pull_request_comment.
 # Read tools such as jira_get_issue, jira_get_transitions, confluence_get_page,
 # bitbucket_get_repo, bitbucket_get_pull_request, bitbucket_list_pull_requests,
-# bitbucket_list_branches, bitbucket_list_directory, bitbucket_get_file_content work when false.
+# bitbucket_list_pull_request_changes, bitbucket_list_branches,
+# bitbucket_list_directory, bitbucket_get_file_content work when false.
 # enable_writes = false

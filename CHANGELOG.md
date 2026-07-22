@@ -7,7 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - Bitbucket tools:
-  - Browse: `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`, `bitbucket_list_pull_requests` (with `has_more` pagination hint)
+  - Browse: `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`, `bitbucket_list_pull_requests` (with `has_more` pagination hint), `bitbucket_list_pull_request_changes` (diffstat only)
   - Write: `bitbucket_merge_pull_request` (merge_commit strategy, optional `close_source_branch`)
   - Write: `bitbucket_decline_pull_request` and `bitbucket_delete_branch`
   - Write: `bitbucket_add_pull_request_comment`
