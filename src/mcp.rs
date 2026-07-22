@@ -726,6 +726,19 @@ fn all_tools() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "bitbucket_list_pull_request_changes",
+            description: "List changed files and line statistics for a pull request (diffstat, not raw diff).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_slug": { "type": "string", "description": "Repository slug" },
+                    "pull_request_id": { "type": "string", "description": "Numeric pull request ID" }
+                },
+                "required": ["repo_slug", "pull_request_id"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
             name: "bitbucket_list_branches",
             description: "List branches in a Bitbucket repository.",
             input_schema: json!({
@@ -1364,6 +1377,35 @@ fn resolve_target(
                 method: Method::GET,
                 path: format!(
                     "/repositories/{workspace}/{repo_slug}/pullrequests?state={state_str}"
+                ),
+                body: RequestBody::None,
+                update: None,
+                resolve_ref: None,
+            })
+        }
+        "bitbucket_list_pull_request_changes" => {
+            let args = args.ok_or("missing arguments")?;
+            let repo_slug = args
+                .get("repo_slug")
+                .and_then(|v| v.as_str())
+                .ok_or("missing repo_slug")?;
+            valid_repo_slug(repo_slug)?;
+            let pull_request_id = args
+                .get("pull_request_id")
+                .and_then(|v| v.as_str())
+                .ok_or("missing pull_request_id")?;
+            if pull_request_id.is_empty() || !pull_request_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err("pull_request_id must be a non-empty numeric id".into());
+            }
+            let workspace = workspace.ok_or("missing bitbucket workspace")?;
+            Ok(ToolTarget {
+                workspace: Some(workspace.into()),
+                repo: Some(repo_slug.into()),
+                project: None,
+                space: None,
+                method: Method::GET,
+                path: format!(
+                    "/repositories/{workspace}/{repo_slug}/pullrequests/{pull_request_id}/diffstat"
                 ),
                 body: RequestBody::None,
                 update: None,
@@ -2059,6 +2101,7 @@ mod tests {
                     "bitbucket_get_repo".into(),
                     "bitbucket_get_pull_request".into(),
                     "bitbucket_list_pull_requests".into(),
+                    "bitbucket_list_pull_request_changes".into(),
                     "bitbucket_list_branches".into(),
                     "bitbucket_list_directory".into(),
                     "bitbucket_get_file_content".into(),
@@ -4130,6 +4173,42 @@ mod tests {
             }))
         };
 
+        let diffstat_handler = |State(s): State<MockState>,
+                                Path((workspace, repo, pr_id)): Path<(String, String, String)>,
+                                headers: HeaderMap| async move {
+            s.headers.lock().unwrap().push(headers);
+            Json(json!({
+                "values": [
+                    {
+                        "status": "added",
+                        "old": null,
+                        "new": { "path": "src/new.rs", "type": "commit_file" },
+                        "lines_added": 42,
+                        "lines_removed": 0
+                    },
+                    {
+                        "status": "modified",
+                        "old": { "path": "src/main.rs", "type": "commit_file" },
+                        "new": { "path": "src/main.rs", "type": "commit_file" },
+                        "lines_added": 10,
+                        "lines_removed": 3
+                    },
+                    {
+                        "status": "removed",
+                        "old": { "path": "README.old", "type": "commit_file" },
+                        "new": null,
+                        "lines_added": 0,
+                        "lines_removed": 5
+                    }
+                ],
+                "size": 3,
+                "page": 1,
+                "pagelen": 10,
+                "pullrequest": { "id": pr_id, "title": "PR title" },
+                "repository": { "full_name": format!("{workspace}/{repo}") }
+            }))
+        };
+
         let create_repo_handler = |State(s): State<MockState>,
                                    Path((workspace, repo)): Path<(String, String)>,
                                    headers: HeaderMap,
@@ -4339,6 +4418,10 @@ mod tests {
                 get(pr_handler),
             )
             .route(
+                "/repositories/{workspace}/{repo}/pullrequests/{pr_id}/diffstat",
+                get(diffstat_handler),
+            )
+            .route(
                 "/repositories/{workspace}/{repo}/refs/branches",
                 get(list_branches_handler).post(create_branch_handler),
             )
@@ -4477,6 +4560,131 @@ mod tests {
                 .unwrap(),
             "Bearer test-token"
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_list_pull_request_changes_allowed_and_has_no_code() {
+        let (port, captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_list_pull_request_changes",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        let values = json["result"]["structuredContent"]["values"]
+            .as_array()
+            .unwrap();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0]["status"], "added");
+        assert_eq!(values[0]["new"]["path"], "src/new.rs");
+        assert_eq!(values[0]["lines_added"], 42);
+        assert_eq!(values[1]["status"], "modified");
+        assert!(!values[1].as_object().unwrap().contains_key("diff"));
+        assert!(!json["result"]["structuredContent"]
+            .to_string()
+            .contains("fn main"));
+
+        let upstream_headers = captured.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            upstream_headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer test-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_list_pull_request_changes_invalid_id_returns_400() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["my-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_list_pull_request_changes",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42abc"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_bitbucket_list_pull_request_changes_allowlist_blocks_repo() {
+        let (port, _captured, _bodies) = mock_bitbucket_server().await;
+        let config = bitbucket_test_config(
+            format!("http://127.0.0.1:{}", port),
+            None,
+            vec!["WORK".into()],
+            vec!["allowed-repo".into()],
+        );
+        let bitbucket = BitbucketClient::new(config.bitbucket.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: None,
+            confluence: None,
+            bitbucket: Some(bitbucket),
+            audit: None,
+        };
+        let app = crate::router(state);
+        let response = app
+            .oneshot(build_request(
+                "bitbucket_list_pull_request_changes",
+                json!({"repo_slug": "my-repo", "pull_request_id": "42"}),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], true);
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not permitted by agent policy"));
     }
 
     #[tokio::test]

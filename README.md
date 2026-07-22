@@ -369,6 +369,7 @@ Example `tools/call` envelope:
 | `bitbucket_get_repo` | Fetch a Bitbucket repository | `repo_slug` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_get_pull_request` | Fetch a Bitbucket pull request | `repo_slug`, `pull_request_id` (from config `workspace`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_list_pull_requests` | List pull requests in a repository | `repo_slug`, optional `state` (`OPEN`, `MERGED`, `DECLINED`, `SUPERSEDED`; default `OPEN`) | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
+| `bitbucket_list_pull_request_changes` | List changed files and line statistics for a pull request (diffstat) | `repo_slug`, `pull_request_id` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_list_branches` | List branches in a Bitbucket repository | `repo_slug` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_list_directory` | List files/directories at a path in a repo | `repo_slug`, optional `path`, optional `ref` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
 | `bitbucket_get_file_content` | Read the raw contents of a file in a repo | `repo_slug`, `path`, optional `ref` | `bitbucket_workspaces`, `bitbucket_repos` | No | No |
@@ -680,6 +681,7 @@ tools = [
   "bitbucket_get_repo",
   "bitbucket_get_pull_request",
   "bitbucket_list_pull_requests",
+  "bitbucket_list_pull_request_changes",
   "bitbucket_list_branches",
   "bitbucket_list_directory",
   "bitbucket_get_file_content",
@@ -856,7 +858,7 @@ Choose one of the following authentication methods:
    before expiry. The consumer must be granted at least:
 
    - `repository:read` — for `bitbucket_get_repo`, `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`
-   - `pullrequest:read` — for `bitbucket_get_pull_request`, `bitbucket_list_pull_requests`
+   - `pullrequest:read` — for `bitbucket_get_pull_request`, `bitbucket_list_pull_requests`, `bitbucket_list_pull_request_changes`
    - `repository:write` — for `bitbucket_create_branch`, `bitbucket_create_commit`
    - `repository:admin` — for `bitbucket_create_repo` (Bitbucket's API requires admin scope to create repositories; this is different from `repository:write`)
    - `pullrequest:write` — for `bitbucket_create_pull_request`
@@ -899,7 +901,7 @@ Scope-to-tool mapping:
 - `repository:admin` — `bitbucket_create_repo` (Bitbucket requires admin scope for repository creation)
 - `repository:read` — `bitbucket_get_repo`, `bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`
 - `repository:write` — `bitbucket_create_branch`, `bitbucket_create_commit`, `bitbucket_delete_branch`
-- `pullrequest:read` — `bitbucket_get_pull_request`, `bitbucket_list_pull_requests`
+- `pullrequest:read` — `bitbucket_get_pull_request`, `bitbucket_list_pull_requests`, `bitbucket_list_pull_request_changes`
 - `pullrequest:write` — `bitbucket_create_pull_request`, `bitbucket_merge_pull_request`, `bitbucket_decline_pull_request`, `bitbucket_add_pull_request_comment`
 
 ### Agent allowlists
@@ -916,8 +918,8 @@ Scope-to-tool mapping:
 ### Read vs. write and audit
 
 Read tools (`jira_get_issue`, `confluence_get_page`, `bitbucket_get_repo`,
-`bitbucket_get_pull_request`, `bitbucket_list_pull_requests`, `bitbucket_list_branches`,
-`bitbucket_list_directory`, `bitbucket_get_file_content`) pass through the allowlist and do not touch the
+`bitbucket_get_pull_request`, `bitbucket_list_pull_requests`, `bitbucket_list_pull_request_changes`,
+`bitbucket_list_branches`, `bitbucket_list_directory`, `bitbucket_get_file_content`) pass through the allowlist and do not touch the
 audit log.
 
 Write tools (`jira_create_issue`, `jira_add_comment`, `confluence_create_page`,
