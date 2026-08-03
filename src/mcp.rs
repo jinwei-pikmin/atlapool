@@ -819,7 +819,13 @@ fn all_tools() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "issue_key": { "type": "string", "description": "Issue key, e.g. PROJ-123" },
-                    "body": { "description": "Comment body (ADF object or string)" }
+                    "body": {
+                        "description": "Comment body (ADF object or stringified JSON)",
+                        "oneOf": [
+                            { "type": "string", "description": "Stringified Atlassian Document Format (ADF) JSON" },
+                            { "type": "object", "description": "Atlassian Document Format (ADF) object" }
+                        ]
+                    }
                 },
                 "required": ["issue_key", "body"],
                 "additionalProperties": false
@@ -1323,7 +1329,27 @@ fn resolve_target(
                 .ok_or("missing issue_key")?;
             valid_issue_key(issue_key)?;
             let project = issue_key.split_once('-').map(|(p, _)| p.to_string());
-            let body = args.get("body").cloned().ok_or("missing body")?;
+            let raw_body = args.get("body").cloned().ok_or("missing body")?;
+            let adf_body = if let Some(s) = raw_body.as_str() {
+                // Defensive: clients (e.g. Claude Code) sometimes stringify the ADF
+                // object. If the string is valid JSON, reparse it into an object.
+                serde_json::from_str(s).unwrap_or_else(|_| {
+                    // Plain text string: wrap it in a minimal ADF paragraph so the
+                    // upstream call still succeeds.
+                    json!({
+                        "type": "doc",
+                        "version": 1,
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": [{ "type": "text", "text": s }]
+                            }
+                        ]
+                    })
+                })
+            } else {
+                raw_body
+            };
             Ok(ToolTarget {
                 workspace: None,
                 repo: None,
@@ -1331,7 +1357,7 @@ fn resolve_target(
                 space: None,
                 method: Method::POST,
                 path: format!("/rest/api/3/issue/{issue_key}/comment"),
-                body: RequestBody::json(json!({ "body": body })),
+                body: RequestBody::json(json!({ "body": adf_body })),
                 update: None,
                 resolve_ref: None,
                 max_lines: None,
@@ -3549,6 +3575,104 @@ mod tests {
         assert!(lines[1].contains("\"result\":\"success\""));
 
         std::fs::remove_file(&audit_path).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_add_comment_reparses_stringified_adf() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            Some(temp_audit_path()),
+        );
+        let audit_path = config.audit.path.clone().unwrap();
+        let audit = Some(AuditLog::new(audit_path));
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit,
+        };
+        let app = crate::router(state);
+
+        // Reproduce the client-side bug: the ADF object is serialized to a JSON string.
+        let stringified_adf = r#"{"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"Hello"}]}]}"#;
+        let response = app
+            .oneshot(build_request(
+                "jira_add_comment",
+                json!({
+                    "issue_key": "PROJ-123",
+                    "body": stringified_adf
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(
+            json["result"]["structuredContent"]["body"]["body"]["type"],
+            "doc"
+        );
+        assert_eq!(
+            json["result"]["structuredContent"]["body"]["body"]["content"][0]["type"],
+            "paragraph"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_jira_add_comment_wraps_plain_text_as_adf() {
+        let (port, _captured) = mock_jira_server().await;
+        let config = test_config(
+            format!("http://127.0.0.1:{}", port),
+            true,
+            Some(temp_audit_path()),
+        );
+        let audit_path = config.audit.path.clone().unwrap();
+        let audit = Some(AuditLog::new(audit_path));
+        let jira = JiraClient::new(config.atlassian.as_ref().unwrap()).unwrap();
+        let state = AppState {
+            start: Instant::now(),
+            config,
+            jira: Some(jira),
+            confluence: None,
+            bitbucket: None,
+            audit,
+        };
+        let app = crate::router(state);
+
+        let response = app
+            .oneshot(build_request(
+                "jira_add_comment",
+                json!({
+                    "issue_key": "PROJ-123",
+                    "body": "Plain text comment"
+                }),
+                Some("agent-key"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(
+            json["result"]["structuredContent"]["body"]["body"]["type"],
+            "doc"
+        );
+        assert_eq!(
+            json["result"]["structuredContent"]["body"]["body"]["content"][0]["type"],
+            "paragraph"
+        );
     }
 
     #[tokio::test]
