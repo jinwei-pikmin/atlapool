@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `jira_add_comment`: accept `body` as either an ADF object or a stringified JSON string; plain text strings are wrapped into a minimal paragraph ADF (Issue #90)
 - `jira_search_issues`: reject `jql_filter` with unbalanced parentheses to prevent bypassing the forced `project = "..."` wrapper (e.g. `1=1) OR (1=1`)
 - `jira_search_issues`: migrate Jira endpoint from deprecated `/rest/api/3/search` to `/rest/api/3/search/jql`; add `has_more` hint from `nextPageToken`
 

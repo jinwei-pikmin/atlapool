@@ -359,7 +359,7 @@ Example `tools/call` envelope:
 |---|---|---|---|---|---|
 | `jira_get_issue` | Fetch a Jira issue by key | `issue_key` (e.g. `PROJ-123`) | `projects` (parsed from key) | No | No |
 | `jira_create_issue` | Create a Jira issue | `project`, `summary`, plus any Jira `fields` | `projects` (from `project`) | Yes (`enable_writes = true`) | Yes |
-| `jira_add_comment` | Add a comment to a Jira issue | `issue_key`, `body` (ADF, forwarded as-is) | `projects` (parsed from key) | Yes | Yes |
+| `jira_add_comment` | Add a comment to a Jira issue | `issue_key`, `body` (ADF object or stringified JSON; plain text strings are wrapped as a paragraph ADF) | `projects` (parsed from key) | Yes | Yes |
 | `jira_update_issue` | Update a Jira issue (summary, assignee, or append description) | `issue_key` and at least one of `summary`, `assignee`, or `description_append` | `projects` (parsed from key) | Yes | Yes |
 | `jira_get_transitions` | List available transitions for a Jira issue | `issue_key` | `projects` (parsed from key) | No | No |
 | `jira_transition_issue` | Transition a Jira issue to a new status | `issue_key`, `transition_id` | `projects` (parsed from key) | Yes | Yes |
